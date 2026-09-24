@@ -230,9 +230,16 @@ class AosSettingTab extends PluginSettingTab {
         this.plugin.settings.syncOnStartup = v; await this.plugin.save()
       }))
 
+    // The status bar is the obvious home for this and it is not a reliable one: plenty of themes
+    // hide it, and Kaz could not find it at all (09-24). Anything somebody needs in order to trust
+    // a background sync has to live somewhere a theme cannot remove.
     new Setting(containerEl)
       .setName('Sync now')
-      .addButton(b => b.setButtonText('Sync').onClick(() => this.plugin.sync(true)))
+      .setDesc(this.lastRunLine())
+      .addButton(b => b.setButtonText('Sync').onClick(async () => {
+        await this.plugin.sync(true)
+        this.display()
+      }))
 
     if (this.plugin.state.lastError) {
       containerEl.createEl('p', { text: `Last sync failed: ${this.plugin.state.lastError}`, cls: 'setting-item-description' })
@@ -240,6 +247,19 @@ class AosSettingTab extends PluginSettingTab {
 
     // --- folders that matched nothing ---
     this.renderUnmatched(containerEl)
+  }
+
+  /** What happened last time, in words, wherever the status bar is or is not. */
+  private lastRunLine(): string {
+    const { lastRun, lastError, pushed, pulled } = this.plugin.state as any
+    if (!lastRun) return 'Never synced.'
+    const when = new Date(lastRun)
+    const mins = Math.round((Date.now() - when.getTime()) / 60000)
+    const ago = mins < 1 ? 'just now' : mins < 60 ? `${mins} minutes ago` : `${Math.round(mins / 60)} hours ago`
+    if (lastError) return `Last tried ${ago} and failed: ${lastError}`
+    const sent = Object.keys(pushed || {}).length
+    const written = Object.keys(pulled || {}).length
+    return `Last synced ${ago} — ${sent} file${sent === 1 ? '' : 's'} sent to Agency OS, ${written} written into this vault.`
   }
 
   /**
