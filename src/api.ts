@@ -35,6 +35,12 @@ export interface PullResult {
   write_into: string
 }
 
+/** The key is dead. Separate from a network blip so the UI can say so and offer a reconnect. */
+export class AuthError extends Error {
+  readonly isAuthError = true
+  constructor(message: string) { super(message); this.name = 'AuthError' }
+}
+
 export class AosApi {
   constructor(private baseUrl: string, private key: string) {}
 
@@ -55,6 +61,10 @@ export class AosApi {
 
   async config(): Promise<Config> {
     const res = await this.call('GET', '/api/plugin/config')
+    // A 401 means the key itself is no longer good — revoked in aOS, or the workspace is gone.
+    // Distinguished from any other failure because it is the one the user must act on, and the
+    // one that otherwise hides: a plugin holding a dead key looks connected forever.
+    if (res.status === 401) throw new AuthError(res.json?.error || 'This connection is no longer valid')
     if (res.status !== 200) throw new Error(res.json?.error || `aOS returned ${res.status}`)
     return res.json as Config
   }

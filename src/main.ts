@@ -1,5 +1,5 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFolder, normalizePath } from 'obsidian'
-import { AosApi, startAuth, pollAuth } from './api'
+import { AosApi, AuthError, startAuth, pollAuth } from './api'
 import { AosSettings, SyncState, DEFAULT_SETTINGS, DEFAULT_STATE } from './settings'
 import { runSync } from './sync'
 
@@ -10,6 +10,8 @@ export default class AosSyncPlugin extends Plugin {
   state: SyncState = DEFAULT_STATE
   private statusEl: HTMLElement | null = null
   private running = false
+  /** Whether the key aOS holds still matches ours. Checked, not assumed. */
+  connection: 'unknown' | 'ok' | 'revoked' = 'unknown'
 
   async onload() {
     const stored = (await this.loadData()) as Partial<Stored> | null
@@ -26,6 +28,8 @@ export default class AosSyncPlugin extends Plugin {
     if (this.settings.interval > 0) {
       this.registerInterval(window.setInterval(() => this.sync(false), this.settings.interval * 60_000))
     }
+    // Checked once on load, so a revoked connection is visible before anyone tries to use it.
+    if (this.settings.apiKey) this.app.workspace.onLayoutReady(() => this.checkConnection())
     if (this.settings.syncOnStartup && this.settings.apiKey) {
       // After layout so a sync never competes with the vault finishing its own load.
       this.app.workspace.onLayoutReady(() => this.sync(false))
@@ -38,11 +42,33 @@ export default class AosSyncPlugin extends Plugin {
     if (!this.statusEl) return
     if (!this.settings.apiKey) { this.statusEl.setText('aOS: not connected'); return }
     if (this.running) { this.statusEl.setText('aOS: syncing…'); return }
+    if (this.connection === 'revoked') { this.statusEl.setText('aOS: connection revoked'); return }
     if (this.state.lastError) { this.statusEl.setText('aOS: last sync failed'); return }
     this.statusEl.setText(this.state.lastRun ? `aOS: synced ${short(this.state.lastRun)}` : 'aOS: not synced yet')
   }
 
   api() { return new AosApi(this.settings.baseUrl.replace(/\/+$/, ''), this.settings.apiKey) }
+
+  /**
+   * Ask aOS whether our key is still good.
+   *
+   * Without this the plugin reports "Connected" on the strength of holding a string, which stays
+   * true after the key has been revoked at the other end — so somebody sees a healthy settings
+   * page and a stale "synced 3d ago" while nothing has worked since.
+   */
+  async checkConnection(): Promise<void> {
+    if (!this.settings.apiKey) { this.connection = 'unknown'; return }
+    try {
+      const cfg = await this.api().config()
+      this.connection = 'ok'
+      if (cfg.org?.name) this.settings.orgName = cfg.org.name
+    } catch (err) {
+      // Only an auth failure means revoked. Being offline is not the same thing and must not
+      // tell somebody to reconnect a connection that is fine.
+      if (err instanceof AuthError) this.connection = 'revoked'
+    }
+    this.paint()
+  }
 
   async sync(manual: boolean) {
     if (this.running) return
@@ -56,6 +82,7 @@ export default class AosSyncPlugin extends Plugin {
 
       this.state.lastRun = new Date().toISOString()
       this.state.lastError = null
+      this.connection = 'ok'
       await this.save()
       // aOS's connector health reads this, which is what makes a sync that stopped visible to the
       // agency rather than only to whoever is sitting at this machine.
@@ -74,6 +101,9 @@ export default class AosSyncPlugin extends Plugin {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      // A dead key is not a failed sync, and saying "sync failed" for it sends somebody looking
+      // at their network instead of at their connection.
+      if (err instanceof AuthError || /no longer valid|organization API key/i.test(message)) this.connection = 'revoked'
       this.state.lastError = message
       await this.save()
       await api.ack({ ok: false, error: message }).catch(() => {})
@@ -100,19 +130,41 @@ class AosSettingTab extends PluginSettingTab {
     const { containerEl } = this
     containerEl.empty()
 
+    // Opening this page is exactly when somebody wants the truth about the connection, so it is
+    // re-checked here rather than trusted from load.
+    if (this.plugin.settings.apiKey) {
+      this.plugin.checkConnection().then(() => {
+        // Only redraw if the answer changed the page, to avoid a visible flicker on every open.
+        if (this.plugin.connection === 'revoked') this.display()
+      })
+    }
+
     // --- connection ---
     if (!this.plugin.settings.apiKey) {
       new Setting(containerEl)
         .setName('Connect to Agency OS')
         .setDesc('Opens Agency OS in your browser. Approve it there and this plugin picks it up — you never copy a key.')
         .addButton(b => b.setButtonText('Connect').setCta().onClick(() => this.connect()))
+    } else if (this.plugin.connection === 'revoked') {
+      // The state that used to be invisible: we hold a key, aOS does not recognise it.
+      new Setting(containerEl)
+        .setName('This connection was revoked')
+        .setDesc('Agency OS no longer recognises this plugin — the key was revoked, or the workspace changed. Nothing will sync until you reconnect.')
+        .addButton(b => b.setButtonText('Reconnect').setCta().onClick(async () => {
+          this.plugin.settings.apiKey = ''
+          this.plugin.settings.orgName = null
+          this.plugin.connection = 'unknown'
+          await this.plugin.save()
+          this.display()
+        }))
     } else {
       new Setting(containerEl)
-        .setName('Connected')
+        .setName(this.plugin.connection === 'ok' ? 'Connected' : 'Connected (not verified yet)')
         .setDesc(this.plugin.settings.orgName ? `To ${this.plugin.settings.orgName}.` : 'To your Agency OS workspace.')
         .addButton(b => b.setButtonText('Disconnect').setWarning().onClick(async () => {
           this.plugin.settings.apiKey = ''
           this.plugin.settings.orgName = null
+          this.plugin.connection = 'unknown'
           await this.plugin.save()
           this.display()
         }))
