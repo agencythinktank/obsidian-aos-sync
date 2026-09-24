@@ -242,7 +242,11 @@ class AosSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Sync now')
       .setDesc(this.lastRunLine())
-      .addButton(b => b.setButtonText('Sync').onClick(async () => {
+      // Offered FIRST, and the one to reach for on a real vault. Pointing this at somebody's
+      // actual client folders without showing them what it would send first is asking them to
+      // trust a thing they have never seen run.
+      .addButton(b => b.setButtonText('Preview').onClick(() => this.preview()))
+      .addButton(b => b.setButtonText('Sync').setCta().onClick(async () => {
         await this.plugin.sync(true)
         this.display()
       }))
@@ -312,6 +316,37 @@ class AosSettingTab extends PluginSettingTab {
           new Notice('Agency OS will overwrite that file on the next sync — your version is gone.')
           this.display()
         }))
+    }
+  }
+
+  /**
+   * Walk everything, send nothing, and say exactly what would happen.
+   *
+   * The honest answer to "is it safe to point this at my real vault": look first. It also catches
+   * the layout mismatch that would otherwise be invisible — a vault keeping one FILE per client
+   * rather than one folder finds nothing and is told nothing.
+   */
+  private async preview() {
+    if (!this.plugin.settings.apiKey) { new Notice('Connect to Agency OS first.'); return }
+    new Notice('Looking at your vault — nothing will be sent.')
+    try {
+      const res = await runSync(this.app, this.plugin.api(), this.plugin.settings,
+        { pushed: {}, pulled: {}, conflicts: {}, lastRun: null, lastError: null }, undefined, true)
+
+      const lines: string[] = []
+      lines.push(`${res.wouldSend?.length || 0} file(s) would be sent to Agency OS.`)
+      if (res.looseFiles.length) {
+        lines.push(`${res.looseFiles.length} markdown file(s) sit directly in this folder rather than in a folder per client — those cannot be synced: ${res.looseFiles.slice(0, 4).join(', ')}${res.looseFiles.length > 4 ? '…' : ''}`)
+      }
+      if (res.unmatched.length) lines.push(`${res.unmatched.length} folder(s) match no client: ${res.unmatched.slice(0, 4).join(', ')}`)
+      if (!res.wouldSend?.length && !res.looseFiles.length && !res.unmatched.length) {
+        lines.push('No client folders found under that path at all — check the Client folder setting.')
+      }
+      new Notice(lines.join('\n\n'), 15000)
+      // Written where it can be read properly, since a notice this long is hard to take in.
+      console.log('[Agency OS] preview', res)
+    } catch (err) {
+      new Notice(`Preview failed: ${err instanceof Error ? err.message : err}`, 8000)
     }
   }
 

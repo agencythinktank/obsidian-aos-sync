@@ -72,6 +72,10 @@ export interface RunResult {
   skipped: string[]
   conflicts: string[]
   unmatched: string[]
+  /** Markdown sitting loose in the client root, which this plugin cannot place. */
+  looseFiles: string[]
+  /** Set on a preview: what WOULD be sent, listed rather than counted. */
+  wouldSend?: string[]
 }
 
 /** Every markdown file under a client's folder, excluding the folder aOS writes into. */
@@ -98,8 +102,10 @@ export async function runSync(
   settings: AosSettings,
   state: SyncState,
   onProgress?: (msg: string) => void,
+  /** Walk everything and report, writing nothing and sending nothing. */
+  dryRun = false,
 ): Promise<RunResult> {
-  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [] }
+  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], looseFiles: [], wouldSend: [] }
 
   onProgress?.('Checking what this workspace allows…')
   const config: Config = await api.config()
@@ -119,6 +125,10 @@ export async function runSync(
   // notes against another is worse than not syncing them.
   const byFolder = new Map<string, Client>()
   for (const child of root.children) {
+    // Markdown directly in the client root, rather than inside a client folder. Some vaults keep
+    // one FILE per client instead of one folder — this plugin cannot place those, and saying so
+    // matters more than skipping them: a silent skip looks identical to having no clients.
+    if (child instanceof TFile && child.extension === 'md') { result.looseFiles.push(child.name); continue }
     if (!(child instanceof TFolder)) continue
     const mapped = settings.folderMap[child.name]
     const client = mapped
@@ -147,7 +157,11 @@ export async function runSync(
       }
     }
 
-    for (let i = 0; i < docs.length; i += 50) {
+    if (dryRun) {
+      result.wouldSend = docs.map(d => d.path)
+      result.pushed = docs.length
+    }
+    for (let i = 0; dryRun ? false : i < docs.length; i += 50) {
       const batch = docs.slice(i, i + 50)
       onProgress?.(`Sending ${i + 1}–${i + batch.length} of ${docs.length}…`)
       const res = await api.push(batch)
@@ -163,7 +177,7 @@ export async function runSync(
   }
 
   // ---- pull --------------------------------------------------------------------------------
-  if (config.may_pull && settings.pull) {
+  if (config.may_pull && settings.pull && !dryRun) {
     for (const [folderName, client] of byFolder) {
       onProgress?.(`Fetching ${client.name}…`)
       const data = await api.pull(client.id, settings.pullSince || undefined)
