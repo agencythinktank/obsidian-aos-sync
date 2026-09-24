@@ -1,0 +1,186 @@
+import { App, TFile, TFolder, normalizePath } from 'obsidian'
+import { AosApi, Client, Config, PushDoc } from './api'
+import { AosSettings, SyncState } from './settings'
+
+// The two directions.
+//
+// THE RULE BOTH OF THEM KEEP: neither side overwrites the other's work.
+//
+//   Pushing sends a copy. aOS files it as history and cannot touch anything a person typed there.
+//   Pulling writes ONLY inside the folder aOS owns, and even there it re-hashes the file first —
+//   if you have edited what aOS wrote, it leaves your version alone and says so rather than
+//   quietly replacing it. That is the same protection Readwise's plugin uses, and it is the whole
+//   reason this is safe to run on a schedule.
+
+/** Cheap, stable, and enough to answer "has this changed since I last saw it". */
+export function hash(text: string): string {
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)
+}
+
+const slugOf = (x: string) => x.toLowerCase().replace(/[^a-z0-9]+/g, '')
+
+export interface RunResult {
+  pushed: number
+  pulled: number
+  skipped: string[]
+  conflicts: string[]
+  unmatched: string[]
+}
+
+/** Every markdown file under a client's folder, excluding the folder aOS writes into. */
+function filesUnder(app: App, folder: TFolder, exclude: string): TFile[] {
+  const out: TFile[] = []
+  const walk = (f: TFolder) => {
+    for (const child of f.children) {
+      if (child instanceof TFolder) {
+        // Never send aOS its own output back to it — that is how a sync loop starts.
+        if (child.name === exclude) continue
+        walk(child)
+      } else if (child instanceof TFile && child.extension === 'md') {
+        out.push(child)
+      }
+    }
+  }
+  walk(folder)
+  return out
+}
+
+export async function runSync(
+  app: App,
+  api: AosApi,
+  settings: AosSettings,
+  state: SyncState,
+  onProgress?: (msg: string) => void,
+): Promise<RunResult> {
+  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [] }
+
+  onProgress?.('Checking what this workspace allows…')
+  const config: Config = await api.config()
+  if (config.direction === 'off') {
+    result.skipped.push('Vault sync is paused for this workspace.')
+    return result
+  }
+
+  const clients = await api.clients()
+  const root = app.vault.getAbstractFileByPath(normalizePath(settings.clientRoot))
+  if (!(root instanceof TFolder)) {
+    throw new Error(`No folder at "${settings.clientRoot}". Set the client folder in the plugin settings.`)
+  }
+
+  // Match a vault folder to a client: an explicit mapping the person made wins, then aOS's own
+  // slugs. A folder that matches nothing is REPORTED, never guessed at — filing one client's
+  // notes against another is worse than not syncing them.
+  const byFolder = new Map<string, Client>()
+  for (const child of root.children) {
+    if (!(child instanceof TFolder)) continue
+    const mapped = settings.folderMap[child.name]
+    const client = mapped
+      ? clients.find(c => c.id === mapped)
+      : clients.find(c => c.slugs.includes(slugOf(child.name)))
+    if (client) byFolder.set(child.name, client)
+    else result.unmatched.push(child.name)
+  }
+
+  // ---- push --------------------------------------------------------------------------------
+  if (config.may_push && settings.push) {
+    const docs: PushDoc[] = []
+    for (const [folderName, client] of byFolder) {
+      const folder = root.children.find(c => c.name === folderName) as TFolder
+      for (const file of filesUnder(app, folder, config.write_into)) {
+        const body = await app.vault.cachedRead(file)
+        const h = hash(body)
+        // Unchanged files cost nothing. Without this, every run re-sends the whole vault.
+        if (state.pushed[file.path] === h) continue
+        docs.push({
+          client_id: client.id,
+          path: file.path,
+          body,
+          occurred_at: new Date(file.stat.mtime).toISOString().slice(0, 10),
+        })
+      }
+    }
+
+    for (let i = 0; i < docs.length; i += 50) {
+      const batch = docs.slice(i, i + 50)
+      onProgress?.(`Sending ${i + 1}–${i + batch.length} of ${docs.length}…`)
+      const res = await api.push(batch)
+      result.skipped.push(...res.skipped)
+      // Only remember a file as sent once aOS has actually taken it.
+      const refused = new Set(res.skipped.map(s => String(s).split(':')[0]))
+      for (const d of batch) {
+        if (refused.has(d.path)) continue
+        state.pushed[d.path] = hash(d.body)
+        result.pushed += 1
+      }
+    }
+  }
+
+  // ---- pull --------------------------------------------------------------------------------
+  if (config.may_pull && settings.pull) {
+    for (const [folderName, client] of byFolder) {
+      onProgress?.(`Fetching ${client.name}…`)
+      const data = await api.pull(client.id, settings.pullSince || undefined)
+      const dir = normalizePath(`${settings.clientRoot}/${folderName}/${config.write_into}`)
+
+      const notes: Array<{ name: string; body: string }> = []
+      if (data.summary) {
+        notes.push({
+          name: 'Where they are now',
+          body: `${data.summary.body}\n\n---\n*${data.summary.provenance || `Updated ${data.summary.updated}`}*\n`,
+        })
+      }
+      if (data.arc.length) {
+        notes.push({
+          name: 'The arc',
+          body: data.arc.map(a => `## ${a.date} — ${a.title}\n\n${a.body}\n`).join('\n'),
+        })
+      }
+      if (data.updates_sent.length) {
+        notes.push({
+          name: 'Updates sent',
+          body: data.updates_sent.map(u => `## Sent ${u.sent_at}\n*Covering ${u.period.start} to ${u.period.end}*\n\n${u.body}\n`).join('\n---\n\n'),
+        })
+      }
+      if (!notes.length) continue
+
+      if (!(app.vault.getAbstractFileByPath(dir) instanceof TFolder)) {
+        await app.vault.createFolder(dir).catch(() => {})
+      }
+
+      for (const note of notes) {
+        const path = normalizePath(`${dir}/${note.name}.md`)
+        const header = '> [!info] Written by Agency OS\n> Everything in this folder comes from aOS. Edit it and aOS will stop replacing it.\n\n'
+        const content = header + note.body
+        const existing = app.vault.getAbstractFileByPath(path)
+
+        if (existing instanceof TFile) {
+          const current = await app.vault.read(existing)
+          // If the file no longer matches what aOS last wrote, a person has edited it. Their
+          // version stands. Saying so is the point — a silent skip is just a different way of
+          // losing work.
+          if (state.pulled[path] && hash(current) !== state.pulled[path]) {
+            result.conflicts.push(path)
+            continue
+          }
+          if (hash(current) === hash(content)) continue
+          await app.vault.modify(existing, content)
+        } else {
+          await app.vault.create(path, content)
+        }
+        state.pulled[path] = hash(content)
+        result.pulled += 1
+      }
+    }
+  }
+
+  return result
+}
