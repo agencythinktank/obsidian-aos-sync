@@ -271,7 +271,7 @@ class AosSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName('Files Agency OS has stopped updating').setHeading()
     containerEl.createEl('p', {
-      text: 'You edited these, so Agency OS leaves them alone and keeps its newer version in a file beside each one. "Keep mine and resume" moves what you wrote under a "Your notes" heading and lets aOS update its own part above it from then on — nothing is lost either way.',
+      text: 'You edited these, so Agency OS leaves them alone and keeps its newer version in a file beside each one. "Keep mine and resume" moves what you wrote under a "Notes" heading and lets aOS update its own part above it from then on — nothing is lost either way.',
       cls: 'setting-item-description',
     })
 
@@ -281,7 +281,7 @@ class AosSettingTab extends PluginSettingTab {
         .setName(path.split('/').pop() || path)
         .setDesc(`In ${path.split('/').slice(0, -1).join('/')} — yours since ${since}.`)
         // The option Kaz asked for, and the one that should be reached for first: keep what you
-        // wrote AND let aOS resume. Everything currently in the file moves under "Your notes",
+        // wrote AND let aOS resume. Everything currently in the file moves under "Notes",
         // aOS's latest goes above it, and from then on the two coexist by section.
         .addButton(b => b.setButtonText('Keep mine and resume').setCta().onClick(async () => {
           const file = this.app.vault.getAbstractFileByPath(path)

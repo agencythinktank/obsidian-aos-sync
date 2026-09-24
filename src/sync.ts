@@ -35,15 +35,35 @@ const slugOf = (x: string) => x.toLowerCase().replace(/[^a-z0-9]+/g, '')
  * rewrites it. This is the same answer the rest of the product gives — ONE OWNER PER SECTION,
  * not per document — rather than a merge that has to guess which words somebody added.
  */
-export const YOURS = '## Your notes'
-const YOURS_HINT = `${YOURS}\n\n*Anything below this line is yours. Agency OS never changes it.*\n\n`
+// Matched to what the Client Vault already does, rather than invented (Kaz, 09-24: this is how
+// we solved it in Obsidian so we could keep our own notes). Two conventions are live in real
+// client files and BOTH are honoured, so a vault already using either is protected the first time
+// this plugin runs, without anybody editing anything to make it so:
+//
+//   `## Notes`            - the heading in nine live client wiki files
+//   `<!-- PROTECTED ...`  - the explicit marker on Two Minute Reports' profile
+//
+// New files use `## Notes` with the marker above it, so the two converge rather than a third
+// convention being added to a vault that already has enough.
+export const YOURS = '## Notes'
+const PROTECTED_MARK = '<!-- PROTECTED'
+// In the real files the heading sits ABOVE the marker, so honouring only the marker would leave
+// the heading on aOS's side of the line and rewrite it away.
+const PROTECTED_HEADING = '## Protected Notes'
+const YOURS_HINT = PROTECTED_MARK + ' - Agency OS never writes below this line. Human only. -->\n' + YOURS + '\n\n'
 
-/** Split a file into what aOS wrote and what a person added underneath. */
+/**
+ * Split a file into what aOS wrote and what a person owns underneath.
+ *
+ * Whichever boundary appears FIRST wins, so a file carrying both markers never leaves an earlier
+ * human section stranded on aOS's side of the line.
+ */
 export function splitOwnership(content: string): { aos: string; yours: string } {
-  const at = content.indexOf(YOURS)
-  return at === -1
-    ? { aos: content, yours: '' }
-    : { aos: content.slice(0, at).trimEnd(), yours: content.slice(at).trimEnd() }
+  const found = [content.indexOf(PROTECTED_MARK), content.indexOf(PROTECTED_HEADING), content.indexOf(YOURS)]
+    .filter(i => i !== -1)
+  if (!found.length) return { aos: content, yours: '' }
+  const at = Math.min.apply(null, found)
+  return { aos: content.slice(0, at).trimEnd(), yours: content.slice(at).trimEnd() }
 }
 
 export interface RunResult {
@@ -177,7 +197,7 @@ export async function runSync(
       for (const note of notes) {
         const path = normalizePath(`${dir}/${note.name}.md`)
         const header = '> [!info] Written by Agency OS\n'
-          + '> This part is rewritten each sync. Add your own notes under "Your notes" at the bottom\n'
+          + '> This part is rewritten each sync. Add your own notes under "Notes" at the bottom\n'
           + '> and they are kept — aOS never touches anything below that line.\n\n'
         const content = header + note.body
         const existing = app.vault.getAbstractFileByPath(path)
