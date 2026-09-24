@@ -156,6 +156,10 @@ class AosSettingTab extends PluginSettingTab {
           this.plugin.connection = 'unknown'
           await this.plugin.save()
           this.display()
+          // Actually reconnect, rather than swapping the panel for a Connect button and leaving
+          // the person to press a second one. A button called Reconnect that only redraws the
+          // page reads as a button that does nothing.
+          await this.connect()
         }))
     } else {
       new Setting(containerEl)
@@ -276,6 +280,7 @@ class AosSettingTab extends PluginSettingTab {
   /** The device flow: open the browser, poll until approved. */
   private async connect() {
     const base = this.plugin.settings.baseUrl.replace(/\/+$/, '')
+    new Notice('Opening Agency OS to approve this connection…')
     let start
     try { start = await startAuth(base, `Obsidian — ${this.app.vault.getName()}`) }
     catch (err) { new Notice(`Could not reach Agency OS: ${err instanceof Error ? err.message : err}`); return }
