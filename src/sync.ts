@@ -165,12 +165,35 @@ export async function runSync(
         if (existing instanceof TFile) {
           const current = await app.vault.read(existing)
           // If the file no longer matches what aOS last wrote, a person has edited it. Their
-          // version stands. Saying so is the point — a silent skip is just a different way of
-          // losing work.
+          // version stands.
+          //
+          // But standing back forever and saying so once in a toast is its own failure: aOS keeps
+          // producing new summaries, this copy stays frozen at the moment it was edited, and
+          // months later somebody is reading something stale that looks current (Kaz, 09-24).
+          //
+          // So the newer version is written ALONGSIDE, in its own file. Nothing of theirs is
+          // touched, nothing from aOS is lost, and the difference is visible in the folder rather
+          // than only in a notice that has scrolled away.
           if (state.pulled[path] && hash(current) !== state.pulled[path]) {
             result.conflicts.push(path)
+            const asidePath = normalizePath(`${dir}/${note.name} (newer from aOS).md`)
+            const aside = `> [!warning] You edited "${note.name}", so aOS stopped replacing it\n`
+              + `> This is what aOS has now, kept separate so neither version is lost. Merge what you want\n`
+              + `> into your own file, then use "Let aOS manage this again" in the plugin settings.\n\n`
+              + note.body
+            const existingAside = app.vault.getAbstractFileByPath(asidePath)
+            if (existingAside instanceof TFile) {
+              if (hash(await app.vault.read(existingAside)) !== hash(aside)) await app.vault.modify(existingAside, aside)
+            } else {
+              await app.vault.create(asidePath, aside)
+            }
+            // Remembered so the settings page can list it long after the notice has gone.
+            state.conflicts = state.conflicts || {}
+            state.conflicts[path] = { since: state.conflicts[path]?.since || new Date().toISOString(), aside: asidePath }
             continue
           }
+          // Back in step: if it was in conflict and now matches again, stop reporting it.
+          if (state.conflicts?.[path]) delete state.conflicts[path]
           if (hash(current) === hash(content)) continue
           await app.vault.modify(existing, content)
         } else {

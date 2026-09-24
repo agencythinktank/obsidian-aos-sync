@@ -47,8 +47,15 @@ export const DEFAULT_SETTINGS: AosSettings = {
 export interface SyncState {
   pushed: Record<string, string>
   pulled: Record<string, string>
+  /**
+   * Files aOS has stopped updating because a person edited them.
+   *
+   * Persistent on purpose. A sync notice is seen once and scrolls away, and the consequence —
+   * a summary quietly frozen while aOS keeps producing new ones — lasts until somebody notices.
+   */
+  conflicts?: Record<string, { since: string; aside: string }>
   lastRun: string | null
   lastError: string | null
 }
 
-export const DEFAULT_STATE: SyncState = { pushed: {}, pulled: {}, lastRun: null, lastError: null }
+export const DEFAULT_STATE: SyncState = { pushed: {}, pulled: {}, conflicts: {}, lastRun: null, lastError: null }

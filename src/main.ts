@@ -90,7 +90,7 @@ export default class AosSyncPlugin extends Plugin {
 
       if (manual) {
         const bits = [`${res.pushed} sent`, `${res.pulled} written`]
-        if (res.conflicts.length) bits.push(`${res.conflicts.length} left alone (you have edited them)`)
+        if (res.conflicts.length) bits.push(`${res.conflicts.length} left alone — aOS's newer version is beside each one`)
         if (res.unmatched.length) bits.push(`${res.unmatched.length} folder(s) matched no client`)
         new Notice(`Agency OS: ${bits.join(', ')}.`)
       }
@@ -245,8 +245,47 @@ class AosSettingTab extends PluginSettingTab {
       containerEl.createEl('p', { text: `Last sync failed: ${this.plugin.state.lastError}`, cls: 'setting-item-description' })
     }
 
+    this.renderConflicts(containerEl)
+
     // --- folders that matched nothing ---
     this.renderUnmatched(containerEl)
+  }
+
+  /**
+   * Files aOS has stopped updating, and the way back.
+   *
+   * Without this the only warning is a sync notice seen once. The consequence outlives it by
+   * months: aOS keeps writing new summaries, this copy stays frozen, and it still looks like a
+   * live document (Kaz, 09-24).
+   */
+  private renderConflicts(containerEl: HTMLElement) {
+    const conflicts = this.plugin.state.conflicts || {}
+    const paths = Object.keys(conflicts)
+    if (!paths.length) return
+
+    new Setting(containerEl).setName('Files Agency OS has stopped updating').setHeading()
+    containerEl.createEl('p', {
+      text: 'You edited these, so Agency OS leaves them alone. It keeps writing its newer version to a file beside each one, so nothing is lost either way.',
+      cls: 'setting-item-description',
+    })
+
+    for (const path of paths) {
+      const since = new Date(conflicts[path].since).toISOString().slice(0, 10)
+      new Setting(containerEl)
+        .setName(path.split('/').pop() || path)
+        .setDesc(`In ${path.split('/').slice(0, -1).join('/')} — yours since ${since}.`)
+        .addButton(b => b.setButtonText('Let aOS manage this again').onClick(async () => {
+          // Deliberately destructive and said so: their version is replaced on the next sync.
+          // Forgetting the hash is what makes aOS treat the file as its own again.
+          delete this.plugin.state.pulled[path]
+          const aside = this.app.vault.getAbstractFileByPath(conflicts[path].aside)
+          if (aside) await this.app.fileManager.trashFile(aside)
+          delete (this.plugin.state.conflicts || {})[path]
+          await this.plugin.save()
+          new Notice('Agency OS will overwrite that file on the next sync.')
+          this.display()
+        }))
+    }
   }
 
   /** What happened last time, in words, wherever the status bar is or is not. */
