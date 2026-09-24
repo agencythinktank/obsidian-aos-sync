@@ -1,7 +1,7 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFolder, normalizePath } from 'obsidian'
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath } from 'obsidian'
 import { AosApi, AuthError, startAuth, pollAuth } from './api'
 import { AosSettings, SyncState, DEFAULT_SETTINGS, DEFAULT_STATE } from './settings'
-import { runSync } from './sync'
+import { runSync, splitOwnership, YOURS } from './sync'
 
 interface Stored { settings: AosSettings; state: SyncState }
 
@@ -86,7 +86,13 @@ export default class AosSyncPlugin extends Plugin {
       await this.save()
       // aOS's connector health reads this, which is what makes a sync that stopped visible to the
       // agency rather than only to whoever is sitting at this machine.
-      await api.ack({ ok: true, pushed: res.pushed, pulled: res.pulled, skipped: res.skipped.length })
+      // Reported to aOS as well, because somebody who lives in aOS will never see an Obsidian
+      // notice (Kaz, 09-24). This is what lets the agency see a vault drifting out of step.
+      await api.ack({
+        ok: true, pushed: res.pushed, pulled: res.pulled, skipped: res.skipped.length,
+        conflicts: Object.keys(this.state.conflicts || {}),
+        unmatched: res.unmatched,
+      })
 
       if (manual) {
         const bits = [`${res.pushed} sent`, `${res.pulled} written`]
@@ -265,7 +271,7 @@ class AosSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName('Files Agency OS has stopped updating').setHeading()
     containerEl.createEl('p', {
-      text: 'You edited these, so Agency OS leaves them alone. It keeps writing its newer version to a file beside each one, so nothing is lost either way.',
+      text: 'You edited these, so Agency OS leaves them alone and keeps its newer version in a file beside each one. "Keep mine and resume" moves what you wrote under a "Your notes" heading and lets aOS update its own part above it from then on — nothing is lost either way.',
       cls: 'setting-item-description',
     })
 
@@ -274,15 +280,36 @@ class AosSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName(path.split('/').pop() || path)
         .setDesc(`In ${path.split('/').slice(0, -1).join('/')} — yours since ${since}.`)
-        .addButton(b => b.setButtonText('Let aOS manage this again').onClick(async () => {
+        // The option Kaz asked for, and the one that should be reached for first: keep what you
+        // wrote AND let aOS resume. Everything currently in the file moves under "Your notes",
+        // aOS's latest goes above it, and from then on the two coexist by section.
+        .addButton(b => b.setButtonText('Keep mine and resume').setCta().onClick(async () => {
+          const file = this.app.vault.getAbstractFileByPath(path)
+          if (!(file instanceof TFile)) { new Notice('That file is no longer here.'); return }
+          const current = await this.app.vault.read(file)
+          const split = splitOwnership(current)
+          // Their whole file becomes theirs, verbatim. Guessing which lines they added is exactly
+          // the merge this design avoids — nothing is lost, and they can tidy it themselves.
+          const yours = split.yours || `${YOURS}\n\n${split.aos.replace(/^> \[!info\][\s\S]*?\n\n/, '').trim()}\n`
+          await this.app.vault.modify(file, yours)
+          // Forgetting the hash makes aOS write its half back above their section next sync.
+          delete this.plugin.state.pulled[path]
+          const aside = this.app.vault.getAbstractFileByPath(conflicts[path].aside)
+          if (aside instanceof TFile) await this.app.fileManager.trashFile(aside)
+          delete (this.plugin.state.conflicts || {})[path]
+          await this.plugin.save()
+          new Notice('Kept your notes. Agency OS will add its part above them on the next sync.')
+          this.display()
+        }))
+        .addButton(b => b.setButtonText('Discard mine').setWarning().onClick(async () => {
           // Deliberately destructive and said so: their version is replaced on the next sync.
           // Forgetting the hash is what makes aOS treat the file as its own again.
           delete this.plugin.state.pulled[path]
           const aside = this.app.vault.getAbstractFileByPath(conflicts[path].aside)
-          if (aside) await this.app.fileManager.trashFile(aside)
+          if (aside instanceof TFile) await this.app.fileManager.trashFile(aside)
           delete (this.plugin.state.conflicts || {})[path]
           await this.plugin.save()
-          new Notice('Agency OS will overwrite that file on the next sync.')
+          new Notice('Agency OS will overwrite that file on the next sync — your version is gone.')
           this.display()
         }))
     }

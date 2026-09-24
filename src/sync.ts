@@ -28,6 +28,24 @@ export function hash(text: string): string {
 
 const slugOf = (x: string) => x.toLowerCase().replace(/[^a-z0-9]+/g, '')
 
+/**
+ * The line that divides a file in two.
+ *
+ * Above it is aOS's, regenerated every sync. Below it is yours, and aOS never reads, moves or
+ * rewrites it. This is the same answer the rest of the product gives — ONE OWNER PER SECTION,
+ * not per document — rather than a merge that has to guess which words somebody added.
+ */
+export const YOURS = '## Your notes'
+const YOURS_HINT = `${YOURS}\n\n*Anything below this line is yours. Agency OS never changes it.*\n\n`
+
+/** Split a file into what aOS wrote and what a person added underneath. */
+export function splitOwnership(content: string): { aos: string; yours: string } {
+  const at = content.indexOf(YOURS)
+  return at === -1
+    ? { aos: content, yours: '' }
+    : { aos: content.slice(0, at).trimEnd(), yours: content.slice(at).trimEnd() }
+}
+
 export interface RunResult {
   pushed: number
   pulled: number
@@ -158,7 +176,9 @@ export async function runSync(
 
       for (const note of notes) {
         const path = normalizePath(`${dir}/${note.name}.md`)
-        const header = '> [!info] Written by Agency OS\n> Everything in this folder comes from aOS. Edit it and aOS will stop replacing it.\n\n'
+        const header = '> [!info] Written by Agency OS\n'
+          + '> This part is rewritten each sync. Add your own notes under "Your notes" at the bottom\n'
+          + '> and they are kept — aOS never touches anything below that line.\n\n'
         const content = header + note.body
         const existing = app.vault.getAbstractFileByPath(path)
 
@@ -174,7 +194,11 @@ export async function runSync(
           // So the newer version is written ALONGSIDE, in its own file. Nothing of theirs is
           // touched, nothing from aOS is lost, and the difference is visible in the folder rather
           // than only in a notice that has scrolled away.
-          if (state.pulled[path] && hash(current) !== state.pulled[path]) {
+          const split = splitOwnership(current)
+          // Only aOS's half decides whether somebody has been editing ITS work. A person writing
+          // under the line is the supported case, not a conflict — that is the entire point of
+          // having a line.
+          if (state.pulled[path] && hash(split.aos) !== state.pulled[path]) {
             result.conflicts.push(path)
             const asidePath = normalizePath(`${dir}/${note.name} (newer from aOS).md`)
             const aside = `> [!warning] You edited "${note.name}", so aOS stopped replacing it\n`
@@ -194,12 +218,15 @@ export async function runSync(
           }
           // Back in step: if it was in conflict and now matches again, stop reporting it.
           if (state.conflicts?.[path]) delete state.conflicts[path]
-          if (hash(current) === hash(content)) continue
-          await app.vault.modify(existing, content)
+          // Their section is carried across verbatim onto the newly written aOS half.
+          const merged = split.yours ? `${content.trimEnd()}\n\n${split.yours}\n` : content
+          if (hash(current) === hash(merged)) continue
+          await app.vault.modify(existing, merged)
         } else {
-          await app.vault.create(path, content)
+          await app.vault.create(path, content + `\n${YOURS_HINT}`)
         }
-        state.pulled[path] = hash(content)
+        // Hash only what aOS owns, so tomorrow's note under the line is not read as tampering.
+        state.pulled[path] = hash(content.trimEnd())
         result.pulled += 1
       }
     }

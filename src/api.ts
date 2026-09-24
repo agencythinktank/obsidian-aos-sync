@@ -92,7 +92,7 @@ export class AosApi {
   }
 
   /** Tell aOS a run finished. This is what its connector health reads. */
-  async ack(summary: { ok: boolean; pushed?: number; pulled?: number; skipped?: number; error?: string }): Promise<void> {
+  async ack(summary: { ok: boolean; pushed?: number; pulled?: number; skipped?: number; error?: string; conflicts?: string[]; unmatched?: string[] }): Promise<void> {
     await this.call('POST', '/api/client-context/sync/ack', summary)
   }
 }
