@@ -72,8 +72,10 @@ export interface RunResult {
   skipped: string[]
   conflicts: string[]
   unmatched: string[]
-  /** Which clients were found, and how much of the vault belongs to each. */
-  matched: Array<{ client: string; files: number }>
+  /** The same, with the notes behind each one, so a picker can record an answer. */
+  unresolved: Array<{ label: string; paths: string[] }>
+  /** Which clients were found, how each was worked out, and which notes belong to them. */
+  matched: Array<{ client: string; clientId: string; files: number; how: string; paths: string[] }>
   /** Set on a preview: what WOULD be sent, listed rather than counted. */
   wouldSend?: string[]
 }
@@ -165,7 +167,7 @@ export async function runSync(
   /** Walk everything and report, writing nothing and sending nothing. */
   dryRun = false,
 ): Promise<RunResult> {
-  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], matched: [], wouldSend: [] }
+  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], unresolved: [], matched: [], wouldSend: [] }
 
   onProgress?.('Checking what this workspace allows…')
   const config: Config = await api.config()
@@ -183,8 +185,8 @@ export async function runSync(
   // Resolve every note independently, so the vault's shape never decides whether it syncs.
   const files = allMarkdown(root, config.write_into)
   const rootPath = normalizePath(settings.clientRoot)
-  const byClient = new Map<string, { client: Client; files: TFile[] }>()
-  const unresolvedFolders = new Set<string>()
+  const byClient = new Map<string, { client: Client; files: TFile[]; hows: string[] }>()
+  const unresolved = new Map<string, string[]>()
 
   for (const file of files) {
     const content = await app.vault.cachedRead(file)
@@ -197,15 +199,24 @@ export async function runSync(
         // person can actually act on.
         const rel = file.path.startsWith(rootPath) ? file.path.slice(rootPath.length + 1) : file.path
         const seg = rel.split('/')
-        unresolvedFolders.add(seg.length > 1 ? seg[0] : file.name)
+        // Grouped by the folder it sits in, or by itself when it sits loose — the unit somebody
+        // can actually answer for.
+        const label = seg.length > 1 ? seg[0] : file.name.replace(/\.md$/i, '')
+        if (!unresolved.has(label)) unresolved.set(label, [])
+        unresolved.get(label)!.push(file.path)
       }
       continue
     }
-    if (!byClient.has(client.id)) byClient.set(client.id, { client, files: [] })
+    if (!byClient.has(client.id)) byClient.set(client.id, { client, files: [], hows: [] })
     byClient.get(client.id)!.files.push(file)
+    byClient.get(client.id)!.hows.push(how)
   }
-  result.unmatched = [...unresolvedFolders]
-  result.matched = [...byClient.values()].map(v => ({ client: v.client.name, files: v.files.length }))
+  result.unmatched = [...unresolved.keys()]
+  result.unresolved = [...unresolved.entries()].map(([label, paths]) => ({ label, paths }))
+  result.matched = [...byClient.values()].map(v => ({
+    client: v.client.name, clientId: v.client.id, files: v.files.length,
+    how: [...new Set(v.hows)].join(', '), paths: v.files.map(f => f.path),
+  }))
 
   // ---- push --------------------------------------------------------------------------------
   if (config.may_push && settings.push) {

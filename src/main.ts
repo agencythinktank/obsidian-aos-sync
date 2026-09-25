@@ -1,7 +1,8 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath } from 'obsidian'
-import { AosApi, AuthError, startAuth, pollAuth } from './api'
+import { AosApi, AuthError, Client, startAuth, pollAuth } from './api'
 import { AosSettings, SyncState, DEFAULT_SETTINGS, DEFAULT_STATE } from './settings'
-import { runSync, splitOwnership, YOURS } from './sync'
+import { runSync, splitOwnership, YOURS, RunResult } from './sync'
+import { stamp, unstamp, hasStamp, suggest, KEY } from './frontmatter'
 
 interface Stored { settings: AosSettings; state: SyncState }
 
@@ -130,6 +131,8 @@ const short = (iso: string) => {
 }
 
 class AosSettingTab extends PluginSettingTab {
+  private lastPreview: RunResult | null = null
+  private clients: Client[] = []
   constructor(app: App, private plugin: AosSyncPlugin) { super(app, plugin) }
 
   display(): void {
@@ -255,10 +258,98 @@ class AosSettingTab extends PluginSettingTab {
       containerEl.createEl('p', { text: `Last sync failed: ${this.plugin.state.lastError}`, cls: 'setting-item-description' })
     }
 
+    this.renderMatching(containerEl)
     this.renderConflicts(containerEl)
 
     // --- folders that matched nothing ---
     this.renderUnmatched(containerEl)
+  }
+
+  /**
+   * What the last preview found, and the two things worth doing about it.
+   *
+   * Recording a match writes ONE property into the note. That is the only place this plugin edits
+   * a file somebody wrote, so it is opt-in, it happens after they have seen the preview, and it
+   * comes with a button that takes it straight back out again. Reversibility answers the "do not
+   * touch my files" objection better than any argument does.
+   */
+  private renderMatching(containerEl: HTMLElement) {
+    const res = this.lastPreview
+    if (!res) return
+
+    new Setting(containerEl).setName('What the preview found').setHeading()
+
+    for (const m of res.matched) {
+      new Setting(containerEl)
+        .setName(m.client)
+        .setDesc(`${m.files} note${m.files === 1 ? '' : 's'} — matched by ${m.how}.`)
+    }
+
+    if (res.matched.length) {
+      new Setting(containerEl)
+        .setName('Record these matches in the notes')
+        .setDesc(`Writes one property — ${KEY} — into each note, so it keeps working after you move or rename anything. Nothing else in the file is changed.`)
+        .addButton(b => b.setButtonText('Record').setCta().onClick(async () => {
+          let written = 0
+          for (const m of res.matched) {
+            for (const path of m.paths) {
+              const f = this.app.vault.getAbstractFileByPath(path)
+              if (!(f instanceof TFile)) continue
+              const before = await this.app.vault.read(f)
+              const after = stamp(before, m.client)
+              // Only touch a file when the answer actually changes, so a synced vault never
+              // conflicts with itself over a property nobody edited.
+              if (after !== before) { await this.app.vault.modify(f, after); written += 1 }
+            }
+          }
+          new Notice(`Recorded the client on ${written} note${written === 1 ? '' : 's'}.`)
+        }))
+    }
+
+    // Near matches become a question, never an assignment.
+    for (const u of res.unresolved.slice(0, 20)) {
+      const options = suggest(u.label, this.clients)
+      new Setting(containerEl)
+        .setName(u.label)
+        .setDesc(options.length
+          ? `${u.paths.length} note${u.paths.length === 1 ? '' : 's'} — did you mean ${options[0].client.name}? (${options[0].why})`
+          : `${u.paths.length} note${u.paths.length === 1 ? '' : 's'} — no client looks close.`)
+        .addDropdown(d => {
+          d.addOption('', 'Do not sync these')
+          for (const o of options) d.addOption(o.client.id, `${o.client.name} — ${o.why}`)
+          for (const c of this.clients) if (!options.some(o => o.client.id === c.id)) d.addOption(c.id, c.name)
+          d.setValue('').onChange(async v => {
+            if (!v) return
+            const client = this.clients.find(c => c.id === v)
+            if (!client) return
+            let written = 0
+            for (const path of u.paths) {
+              const f = this.app.vault.getAbstractFileByPath(path)
+              if (!(f instanceof TFile)) continue
+              const before = await this.app.vault.read(f)
+              const after = stamp(before, client.name)
+              if (after !== before) { await this.app.vault.modify(f, after); written += 1 }
+            }
+            new Notice(`Marked ${written} note${written === 1 ? '' : 's'} as ${client.name}.`)
+            this.lastPreview = null
+            this.display()
+          })
+        })
+    }
+
+    new Setting(containerEl)
+      .setName('Remove all Agency OS properties')
+      .setDesc('Takes the property back out of every note in this vault, and removes the frontmatter block entirely where nothing else was in it.')
+      .addButton(b => b.setButtonText('Remove').setWarning().onClick(async () => {
+        let cleaned = 0
+        for (const f of this.app.vault.getMarkdownFiles()) {
+          const before = await this.app.vault.read(f)
+          if (!hasStamp(before)) continue
+          await this.app.vault.modify(f, unstamp(before))
+          cleaned += 1
+        }
+        new Notice(`Removed it from ${cleaned} note${cleaned === 1 ? '' : 's'}.`)
+      }))
   }
 
   /**
@@ -344,6 +435,8 @@ class AosSettingTab extends PluginSettingTab {
       new Notice(lines.join('\n\n'), 15000)
       // Written where it can be read properly, since a notice this long is hard to take in.
       console.log('[Agency OS] preview', res)
+      this.lastPreview = res
+      this.display()
     } catch (err) {
       new Notice(`Preview failed: ${err instanceof Error ? err.message : err}`, 8000)
     }
@@ -373,6 +466,7 @@ class AosSettingTab extends PluginSettingTab {
 
     let clients
     try { clients = await this.plugin.api().clients() } catch { return }
+    this.clients = clients
     const slug = (x: string) => x.toLowerCase().replace(/[^a-z0-9]+/g, '')
     const unmatched = root.children.filter(c =>
       c instanceof TFolder
