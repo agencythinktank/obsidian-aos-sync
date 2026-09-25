@@ -334,14 +334,13 @@ class AosSettingTab extends PluginSettingTab {
         { pushed: {}, pulled: {}, conflicts: {}, lastRun: null, lastError: null }, undefined, true)
 
       const lines: string[] = []
-      lines.push(`${res.wouldSend?.length || 0} file(s) would be sent to Agency OS.`)
-      if (res.looseFiles.length) {
-        lines.push(`${res.looseFiles.length} markdown file(s) sit directly in this folder rather than in a folder per client — those cannot be synced: ${res.looseFiles.slice(0, 4).join(', ')}${res.looseFiles.length > 4 ? '…' : ''}`)
+      lines.push(`${res.wouldSend?.length || 0} file(s) would be sent, across ${res.matched.length} client(s).`)
+      if (res.matched.length) {
+        lines.push(res.matched.slice(0, 6).map(m => `${m.client}: ${m.files}`).join(' · ')
+          + (res.matched.length > 6 ? ` · +${res.matched.length - 6} more` : ''))
       }
-      if (res.unmatched.length) lines.push(`${res.unmatched.length} folder(s) match no client: ${res.unmatched.slice(0, 4).join(', ')}`)
-      if (!res.wouldSend?.length && !res.looseFiles.length && !res.unmatched.length) {
-        lines.push('No client folders found under that path at all — check the Client folder setting.')
-      }
+      if (res.unmatched.length) lines.push(`No client matches: ${res.unmatched.slice(0, 5).join(', ')}${res.unmatched.length > 5 ? '…' : ''}`)
+      if (!res.matched.length) lines.push('Nothing under that path matched a client. Check the Client folder setting, or add an "aos_client:" line to a note.')
       new Notice(lines.join('\n\n'), 15000)
       // Written where it can be read properly, since a notice this long is hard to take in.
       console.log('[Agency OS] preview', res)

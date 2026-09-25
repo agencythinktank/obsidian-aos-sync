@@ -72,14 +72,14 @@ export interface RunResult {
   skipped: string[]
   conflicts: string[]
   unmatched: string[]
-  /** Markdown sitting loose in the client root, which this plugin cannot place. */
-  looseFiles: string[]
+  /** Which clients were found, and how much of the vault belongs to each. */
+  matched: Array<{ client: string; files: number }>
   /** Set on a preview: what WOULD be sent, listed rather than counted. */
   wouldSend?: string[]
 }
 
-/** Every markdown file under a client's folder, excluding the folder aOS writes into. */
-function filesUnder(app: App, folder: TFolder, exclude: string): TFile[] {
+/** Every markdown file under a root, excluding the folder aOS writes into. */
+function allMarkdown(folder: TFolder, exclude: string): TFile[] {
   const out: TFile[] = []
   const walk = (f: TFolder) => {
     for (const child of f.children) {
@@ -96,6 +96,66 @@ function filesUnder(app: App, folder: TFolder, exclude: string): TFile[] {
   return out
 }
 
+/** The `aos_client:` line from a note's frontmatter, if it has one. */
+export function frontmatterClient(content: string): string | null {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!fm) return null
+  const line = fm[1].split(/\r?\n/).find(l => /^aos[_-]client\s*:/i.test(l))
+  if (!line) return null
+  return line.split(':').slice(1).join(':').trim().replace(/^["']|["']$/g, '') || null
+}
+
+/**
+ * Which client a note belongs to, without caring where it lives.
+ *
+ * Every vault is arranged differently — one folder per client, one FILE per client, a raw/wiki/
+ * output split, nested by year, or none of the above (Kaz, 09-25). Insisting on a shape means
+ * working for one agency and silently doing nothing for the next, so the shape is only ever a
+ * hint. Four signals, most explicit first:
+ *
+ *   1. `aos_client:` in the note's frontmatter — says so outright, and survives any reorganisation
+ *   2. a folder on its path the person mapped by hand
+ *   3. a folder on its path whose name matches a client
+ *   4. the note's own filename matching a client
+ *
+ * Anything still unresolved is REPORTED, never guessed. A note filed against the wrong client is
+ * worse than one that did not sync.
+ */
+export function resolveClient(
+  file: TFile,
+  content: string,
+  rootPath: string,
+  clients: Client[],
+  folderMap: Record<string, string>,
+): { client: Client | null; how: string } {
+  const byId = (v: string) => clients.find(c => c.id === v)
+  const bySlug = (v: string) => clients.find(c => c.slugs.includes(slugOf(v)))
+
+  const declared = frontmatterClient(content)
+  if (declared) {
+    const hit = byId(declared) || bySlug(declared)
+    // A declaration that names nobody is an error worth surfacing, not a reason to fall through
+    // to guessing — somebody wrote that line on purpose.
+    return { client: hit || null, how: hit ? 'frontmatter' : 'frontmatter-unknown' }
+  }
+
+  const rel = file.path.startsWith(rootPath) ? file.path.slice(rootPath.length + 1) : file.path
+  const segments = rel.split('/').slice(0, -1)
+  for (const seg of segments) {
+    if (folderMap[seg]) { const c = byId(folderMap[seg]); if (c) return { client: c, how: 'mapped folder' } }
+  }
+  for (const seg of segments) {
+    const c = bySlug(seg)
+    if (c) return { client: c, how: 'folder name' }
+  }
+
+  const stem = file.name.replace(/\.md$/i, '')
+  const c = bySlug(stem)
+  if (c) return { client: c, how: 'file name' }
+
+  return { client: null, how: 'unresolved' }
+}
+
 export async function runSync(
   app: App,
   api: AosApi,
@@ -105,7 +165,7 @@ export async function runSync(
   /** Walk everything and report, writing nothing and sending nothing. */
   dryRun = false,
 ): Promise<RunResult> {
-  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], looseFiles: [], wouldSend: [] }
+  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], matched: [], wouldSend: [] }
 
   onProgress?.('Checking what this workspace allows…')
   const config: Config = await api.config()
@@ -120,30 +180,38 @@ export async function runSync(
     throw new Error(`No folder at "${settings.clientRoot}". Set the client folder in the plugin settings.`)
   }
 
-  // Match a vault folder to a client: an explicit mapping the person made wins, then aOS's own
-  // slugs. A folder that matches nothing is REPORTED, never guessed at — filing one client's
-  // notes against another is worse than not syncing them.
-  const byFolder = new Map<string, Client>()
-  for (const child of root.children) {
-    // Markdown directly in the client root, rather than inside a client folder. Some vaults keep
-    // one FILE per client instead of one folder — this plugin cannot place those, and saying so
-    // matters more than skipping them: a silent skip looks identical to having no clients.
-    if (child instanceof TFile && child.extension === 'md') { result.looseFiles.push(child.name); continue }
-    if (!(child instanceof TFolder)) continue
-    const mapped = settings.folderMap[child.name]
-    const client = mapped
-      ? clients.find(c => c.id === mapped)
-      : clients.find(c => c.slugs.includes(slugOf(child.name)))
-    if (client) byFolder.set(child.name, client)
-    else result.unmatched.push(child.name)
+  // Resolve every note independently, so the vault's shape never decides whether it syncs.
+  const files = allMarkdown(root, config.write_into)
+  const rootPath = normalizePath(settings.clientRoot)
+  const byClient = new Map<string, { client: Client; files: TFile[] }>()
+  const unresolvedFolders = new Set<string>()
+
+  for (const file of files) {
+    const content = await app.vault.cachedRead(file)
+    const { client, how } = resolveClient(file, content, rootPath, clients, settings.folderMap)
+    if (!client) {
+      if (how === 'frontmatter-unknown') {
+        result.skipped.push(`${file.path}: its aos_client line names a client that is not in Agency OS`)
+      } else {
+        // Reported by the folder it sits in, or by itself if it sits loose — that is the unit a
+        // person can actually act on.
+        const rel = file.path.startsWith(rootPath) ? file.path.slice(rootPath.length + 1) : file.path
+        const seg = rel.split('/')
+        unresolvedFolders.add(seg.length > 1 ? seg[0] : file.name)
+      }
+      continue
+    }
+    if (!byClient.has(client.id)) byClient.set(client.id, { client, files: [] })
+    byClient.get(client.id)!.files.push(file)
   }
+  result.unmatched = [...unresolvedFolders]
+  result.matched = [...byClient.values()].map(v => ({ client: v.client.name, files: v.files.length }))
 
   // ---- push --------------------------------------------------------------------------------
   if (config.may_push && settings.push) {
     const docs: PushDoc[] = []
-    for (const [folderName, client] of byFolder) {
-      const folder = root.children.find(c => c.name === folderName) as TFolder
-      for (const file of filesUnder(app, folder, config.write_into)) {
+    for (const { client, files: mine } of byClient.values()) {
+      for (const file of mine) {
         const body = await app.vault.cachedRead(file)
         const h = hash(body)
         // Unchanged files cost nothing. Without this, every run re-sends the whole vault.
@@ -166,7 +234,6 @@ export async function runSync(
       onProgress?.(`Sending ${i + 1}–${i + batch.length} of ${docs.length}…`)
       const res = await api.push(batch)
       result.skipped.push(...res.skipped)
-      // Only remember a file as sent once aOS has actually taken it.
       const refused = new Set(res.skipped.map(s => String(s).split(':')[0]))
       for (const d of batch) {
         if (refused.has(d.path)) continue
@@ -178,10 +245,19 @@ export async function runSync(
 
   // ---- pull --------------------------------------------------------------------------------
   if (config.may_pull && settings.pull && !dryRun) {
-    for (const [folderName, client] of byFolder) {
+    for (const { client, files: mine } of byClient.values()) {
       onProgress?.(`Fetching ${client.name}…`)
       const data = await api.pull(client.id, settings.pullSince || undefined)
-      const dir = normalizePath(`${settings.clientRoot}/${folderName}/${config.write_into}`)
+      // Where aOS writes depends on how this client's notes are arranged. If they live in a
+      // folder of their own, aOS's folder goes inside it, where somebody would look. If they are
+      // loose files, there is no such folder — so aOS makes one per client under its own, rather
+      // than scattering notes beside somebody else's.
+      const first = mine[0]
+      const rel = first.path.startsWith(rootPath) ? first.path.slice(rootPath.length + 1) : first.path
+      const ownFolder = rel.includes('/') ? rel.split('/')[0] : null
+      const dir = normalizePath(ownFolder
+        ? `${settings.clientRoot}/${ownFolder}/${config.write_into}`
+        : `${settings.clientRoot}/${config.write_into}/${client.name}`)
 
       const notes: Array<{ name: string; body: string }> = []
       if (data.summary) {
