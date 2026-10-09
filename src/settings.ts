@@ -9,7 +9,7 @@ export interface AosSettings {
   /** From the device flow. The only secret this plugin holds. */
   apiKey: string
   orgName: string | null
-  /** The folder in this vault that contains one folder per client. */
+  /** The folder in this vault that holds the client notes (any layout: folders, files, or a mix). */
   clientRoot: string
   /** Turning a direction off locally is allowed; turning one ON that aOS forbids is not. */
   push: boolean

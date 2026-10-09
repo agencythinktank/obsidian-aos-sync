@@ -195,7 +195,7 @@ class AosSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Client folder')
-      .setDesc('The folder holding one folder per client. Folder names are matched to your clients in Agency OS.')
+      .setDesc('The folder your client notes live in. Any layout works: a folder per client, a file per client, or a mix. Notes are matched to your Agency OS clients by an aos_client property, their folder name, or their file name.')
       .addText(t => t.setValue(this.plugin.settings.clientRoot).onChange(async v => {
         this.plugin.settings.clientRoot = v.trim(); await this.plugin.save()
       }))
