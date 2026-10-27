@@ -9,6 +9,12 @@ export interface Config {
   may_push: boolean
   may_pull: boolean
   write_into: string
+  /**
+   * Folder or note name → client id, or 'none' for "do not sync these", answered in aOS
+   * (Settings → Integrations → Obsidian). Beats this plugin's own matching and its local settings,
+   * so the agency can fix a folder without opening Obsidian on this machine. 0.3.0 on.
+   */
+  folder_map?: Record<string, string>
 }
 
 export interface Client {
@@ -92,7 +98,10 @@ export class AosApi {
   }
 
   /** Tell aOS a run finished. This is what its connector health reads. */
-  async ack(summary: { ok: boolean; pushed?: number; pulled?: number; skipped?: number; error?: string; conflicts?: string[]; unmatched?: string[] }): Promise<void> {
+  async ack(summary: {
+    ok: boolean; pushed?: number; pulled?: number; skipped?: number; error?: string; conflicts?: string[]; unmatched?: string[]
+    unresolved?: Array<{ label: string; notes: number }>; auto_matched?: Array<{ label: string; client_id: string }>; version?: string
+  }): Promise<void> {
     await this.call('POST', '/api/client-context/sync/ack', summary)
   }
 }

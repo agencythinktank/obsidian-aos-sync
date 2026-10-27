@@ -93,6 +93,10 @@ export default class AosSyncPlugin extends Plugin {
         ok: true, pushed: res.pushed, pulled: res.pulled, skipped: res.skipped.length,
         conflicts: Object.keys(this.state.conflicts || {}),
         unmatched: res.unmatched,
+        // So the agency can answer these in aOS (Settings → Integrations → Obsidian).
+        unresolved: res.unresolved.map(u => ({ label: u.label, notes: u.paths.length })),
+        auto_matched: Object.entries(this.settings.autoMap || {}).map(([label, client_id]) => ({ label, client_id })),
+        version: this.manifest.version,
       })
 
       if (manual) {
@@ -509,11 +513,17 @@ class AosSettingTab extends PluginSettingTab {
     if (!root) return
 
     let clients
-    try { clients = await this.plugin.api().clients() } catch { return }
+    let answered: Record<string, string> = {}
+    try {
+      clients = await this.plugin.api().clients()
+      answered = (await this.plugin.api().config()).folder_map || {}
+    } catch { return }
     this.clients = clients
     const slug = (x: string) => x.toLowerCase().replace(/[^a-z0-9]+/g, '')
+    // Folders answered in aOS are settled there, so they are not asked about again here.
     const unmatched = root.children.filter(c =>
       c instanceof TFolder
+      && !answered[c.name]
       && !this.plugin.settings.folderMap[c.name]
       && !(this.plugin.settings.autoMap || {})[c.name]
       && !clients.some(cl => cl.slugs.includes(slug(c.name))))

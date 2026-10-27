@@ -237,13 +237,18 @@ export async function runSync(
   // '/' (the top of the vault) stays '/': no note path starts with it, so every path is taken
   // whole, which is right when the client folders sit at the top.
   const rootPath = clientRoot === '/' ? '/' : normalizePath(clientRoot)
+  // Answers given in aOS come first: they are the agency's, and they are how a folder gets fixed
+  // without anybody sitting at this machine.
+  const serverMap = config.folder_map || {}
+  const folderMap = { ...settings.folderMap, ...serverMap }
   const autoMap = { ...(settings.autoMap || {}) }
+  for (const label of Object.keys(serverMap)) delete autoMap[label]
   const byClient = new Map<string, { client: Client; files: TFile[]; hows: string[] }>()
   const unresolved = new Map<string, string[]>()
 
   for (const file of files) {
     const content = await app.vault.cachedRead(file)
-    const { client, how } = resolveClient(file, content, rootPath, clients, settings.folderMap, autoMap)
+    const { client, how } = resolveClient(file, content, rootPath, clients, folderMap, autoMap)
     if (!client) {
       if (how === 'excluded') continue
       if (how === 'frontmatter-unknown') {
