@@ -1,7 +1,7 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath } from 'obsidian'
 import { AosApi, AuthError, Client, startAuth, pollAuth } from './api'
 import { AosSettings, SyncState, DEFAULT_SETTINGS, DEFAULT_STATE } from './settings'
-import { runSync, splitOwnership, YOURS, RunResult } from './sync'
+import { runSync, splitOwnership, YOURS, RunResult, folderAt } from './sync'
 import { stamp, unstamp, hasStamp, suggest, KEY } from './frontmatter'
 
 interface Stored { settings: AosSettings; state: SyncState }
@@ -101,6 +101,14 @@ export default class AosSyncPlugin extends Plugin {
         if (res.unmatched.length) bits.push(`${res.unmatched.length} folder(s) matched no client`)
         new Notice(`Agency OS: ${bits.join(', ')}.`)
       }
+      // Decisions the plugin made on its own are said out loud, even on a scheduled run, and both
+      // can be changed in the settings. Each is said once: after this they are saved.
+      if (res.foundRoot) {
+        new Notice(`Agency OS: found your client notes in "${res.foundRoot.path === '/' ? 'the top of this vault' : res.foundRoot.path}" (${res.foundRoot.clients} client${res.foundRoot.clients === 1 ? '' : 's'}). Change the client folder in the plugin settings if that is wrong.`, 10000)
+      }
+      if (res.autoMatched.length) {
+        new Notice(`Agency OS: matched ${res.autoMatched.slice(0, 3).map(a => `"${a.label}" to ${a.client}`).join(', ')}${res.autoMatched.length > 3 ? ` and ${res.autoMatched.length - 3} more` : ''}. Change any of them in the plugin settings.`, 10000)
+      }
       // Never silent, even on a scheduled run: a folder matching no client means a whole client's
       // notes are not syncing, and nobody would otherwise find out.
       if (res.unmatched.length) {
@@ -195,8 +203,8 @@ class AosSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Client folder')
-      .setDesc('The folder your client notes live in. Any layout works: a folder per client, a file per client, or a mix. Notes are matched to your Agency OS clients by an aos_client property, their folder name, or their file name.')
-      .addText(t => t.setValue(this.plugin.settings.clientRoot).onChange(async v => {
+      .setDesc('The folder your client notes live in. Leave it empty and the plugin finds it: the folder where most notes or folders are named after your Agency OS clients. Any layout works: a folder per client, a file per client, or a mix. Notes are matched to your Agency OS clients by an aos_client property, their folder name, or their file name.')
+      .addText(t => t.setPlaceholder('Found automatically').setValue(this.plugin.settings.clientRoot).onChange(async v => {
         this.plugin.settings.clientRoot = v.trim(); await this.plugin.save()
       }))
 
@@ -259,6 +267,7 @@ class AosSettingTab extends PluginSettingTab {
     }
 
     this.renderMatching(containerEl)
+    this.renderAutoMatched(containerEl)
     this.renderConflicts(containerEl)
 
     // --- folders that matched nothing ---
@@ -425,7 +434,9 @@ class AosSettingTab extends PluginSettingTab {
         { pushed: {}, pulled: {}, conflicts: {}, lastRun: null, lastError: null }, undefined, true)
 
       const lines: string[] = []
+      if (res.foundRoot) lines.push(`Found your client notes in "${res.foundRoot.path === '/' ? 'the top of this vault' : res.foundRoot.path}".`)
       lines.push(`${res.wouldSend?.length || 0} file(s) would be sent, across ${res.matched.length} client(s).`)
+      if (res.autoMatched.length) lines.push(`Would match: ${res.autoMatched.slice(0, 4).map(a => `"${a.label}" → ${a.client}`).join(', ')}${res.autoMatched.length > 4 ? '…' : ''}`)
       if (res.matched.length) {
         lines.push(res.matched.slice(0, 6).map(m => `${m.client}: ${m.files}`).join(' · ')
           + (res.matched.length > 6 ? ` · +${res.matched.length - 6} more` : ''))
@@ -456,13 +467,46 @@ class AosSettingTab extends PluginSettingTab {
   }
 
   /**
+   * What the plugin matched on its own, each with a way to change it.
+   *
+   * A match nobody chose has to be visible and one step to undo. Picking a client here makes it a
+   * person's answer; "Do not sync these" stops it being matched again.
+   */
+  private async renderAutoMatched(containerEl: HTMLElement) {
+    const auto = this.plugin.settings.autoMap || {}
+    const labels = Object.keys(auto).filter(l => !this.plugin.settings.folderMap[l])
+    if (!labels.length || !this.plugin.settings.apiKey) return
+    let clients: Client[]
+    try { clients = this.clients.length ? this.clients : await this.plugin.api().clients() } catch { return }
+    new Setting(containerEl).setName('Matched automatically').setHeading()
+    containerEl.createEl('p', { text: 'Exactly one client fitted each of these names, so the plugin matched them. Change any that are wrong.', cls: 'setting-item-description' })
+    for (const label of labels) {
+      const current = clients.find(c => c.id === auto[label])
+      new Setting(containerEl)
+        .setName(label)
+        .setDesc(current ? `Matched to ${current.name}.` : 'Matched to a client that is no longer in Agency OS.')
+        .addDropdown(d => {
+          d.addOption('none', 'Do not sync these')
+          for (const c of clients) d.addOption(c.id, c.name)
+          d.setValue(current ? current.id : 'none').onChange(async v => {
+            this.plugin.settings.folderMap[label] = v
+            delete this.plugin.settings.autoMap[label]
+            await this.plugin.save()
+            new Notice(v === 'none' ? `"${label}" will not sync.` : `"${label}" now goes to ${clients.find(c => c.id === v)?.name}.`)
+            this.display()
+          })
+        })
+    }
+  }
+
+  /**
    * A folder whose name matches no client. Left to guesswork this silently stops a whole client
    * syncing, so it is surfaced with a picker rather than a warning nobody can act on.
    */
   private async renderUnmatched(containerEl: HTMLElement) {
     if (!this.plugin.settings.apiKey) return
-    const root = this.app.vault.getAbstractFileByPath(normalizePath(this.plugin.settings.clientRoot))
-    if (!(root instanceof TFolder)) return
+    const root = folderAt(this.app, this.plugin.settings.clientRoot)
+    if (!root) return
 
     let clients
     try { clients = await this.plugin.api().clients() } catch { return }
@@ -471,6 +515,7 @@ class AosSettingTab extends PluginSettingTab {
     const unmatched = root.children.filter(c =>
       c instanceof TFolder
       && !this.plugin.settings.folderMap[c.name]
+      && !(this.plugin.settings.autoMap || {})[c.name]
       && !clients.some(cl => cl.slugs.includes(slug(c.name))))
 
     if (!unmatched.length) return

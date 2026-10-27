@@ -9,7 +9,10 @@ export interface AosSettings {
   /** From the device flow. The only secret this plugin holds. */
   apiKey: string
   orgName: string | null
-  /** The folder in this vault that holds the client notes (any layout: folders, files, or a mix). */
+  /**
+   * The folder in this vault that holds the client notes (any layout: folders, files, or a mix).
+   * Empty, or a folder that is not there, means the plugin finds it: see pickRoot in match.ts.
+   */
   clientRoot: string
   /** Turning a direction off locally is allowed; turning one ON that aOS forbids is not. */
   push: boolean
@@ -19,15 +22,25 @@ export interface AosSettings {
   syncOnStartup: boolean
   /** Only pull comms sent since this date, so a long history is not re-fetched forever. */
   pullSince: string
-  /** Vault folder name → aOS client id, for folders whose name matches nothing. */
+  /**
+   * Vault folder name → aOS client id, set by a person. Always wins. The value 'none' means
+   * "do not sync these", so a folder somebody excluded is not matched again behind their back.
+   */
   folderMap: Record<string, string>
+  /**
+   * Folder or note name → aOS client id, matched by the plugin because exactly one client fits
+   * (autoPick in match.ts). Listed in the settings with a way to change each one.
+   */
+  autoMap: Record<string, string>
 }
 
 export const DEFAULT_SETTINGS: AosSettings = {
   baseUrl: 'https://aos.agencythinktank.com',
   apiKey: '',
   orgName: null,
-  clientRoot: 'Clients',
+  // Found on the first sync rather than assumed. The old default, 'Clients', was wrong for the
+  // first real vault connected (Work/Clients), and every sync stopped with nothing sent.
+  clientRoot: '',
   push: true,
   pull: true,
   // Hourly is what Readwise defaults to and it is frequent enough that nobody thinks about it.
@@ -35,6 +48,7 @@ export const DEFAULT_SETTINGS: AosSettings = {
   syncOnStartup: true,
   pullSince: '',
   folderMap: {},
+  autoMap: {},
 }
 
 /**

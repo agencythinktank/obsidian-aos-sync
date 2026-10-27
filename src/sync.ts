@@ -1,6 +1,7 @@
 import { App, TFile, TFolder, normalizePath } from 'obsidian'
 import { AosApi, Client, Config, PushDoc } from './api'
 import { AosSettings, SyncState } from './settings'
+import { autoPick, pickRoot, FolderListing } from './match'
 
 // The two directions.
 //
@@ -78,6 +79,10 @@ export interface RunResult {
   matched: Array<{ client: string; clientId: string; files: number; how: string; paths: string[] }>
   /** Set on a preview: what WOULD be sent, listed rather than counted. */
   wouldSend?: string[]
+  /** Set when the plugin had to find the client folder itself this run. */
+  foundRoot?: { path: string; clients: number }
+  /** Names this run matched to a client because exactly one client fits. */
+  autoMatched: Array<{ label: string; client: string; why: string }>
 }
 
 /** Every markdown file under a root, excluding the folder aOS writes into. */
@@ -96,6 +101,31 @@ function allMarkdown(folder: TFolder, exclude: string): TFile[] {
   }
   walk(folder)
   return out
+}
+
+/** The folder at a path, '/' being the top of the vault. Empty means not set. */
+export function folderAt(app: App, path: string): TFolder | null {
+  if (!path) return null
+  if (path === '/') return app.vault.getRoot()
+  const f = app.vault.getAbstractFileByPath(normalizePath(path))
+  return f instanceof TFolder ? f : null
+}
+
+/** Every folder in the vault with the names directly inside it, for pickRoot. */
+export function findClientRoot(app: App, clients: Client[], exclude: string): { path: string; hits: number } | null {
+  const listings: FolderListing[] = []
+  const walk = (f: TFolder) => {
+    const names: string[] = []
+    for (const child of f.children) {
+      // Obsidian's own folders and aOS's output are never where client notes live.
+      if (child.name.startsWith('.') || child.name === exclude) continue
+      if (child instanceof TFolder) { names.push(child.name); walk(child) }
+      else if (child instanceof TFile && child.extension === 'md') names.push(child.basename)
+    }
+    listings.push({ path: f.isRoot() ? '/' : f.path, names })
+  }
+  walk(app.vault.getRoot())
+  return pickRoot(listings, clients)
 }
 
 /** The `aos_client:` line from a note's frontmatter, if it has one. */
@@ -129,6 +159,7 @@ export function resolveClient(
   rootPath: string,
   clients: Client[],
   folderMap: Record<string, string>,
+  autoMap: Record<string, string> = {},
 ): { client: Client | null; how: string } {
   const byId = (v: string) => clients.find(c => c.id === v)
   const bySlug = (v: string) => clients.find(c => c.slugs.includes(slugOf(v)))
@@ -143,7 +174,10 @@ export function resolveClient(
 
   const rel = file.path.startsWith(rootPath) ? file.path.slice(rootPath.length + 1) : file.path
   const segments = rel.split('/').slice(0, -1)
-  for (const seg of segments) {
+  const stem = file.name.replace(/\.md$/i, '')
+  // A person's answer first, including "do not sync these".
+  for (const seg of [...segments, stem]) {
+    if (folderMap[seg] === 'none') return { client: null, how: 'excluded' }
     if (folderMap[seg]) { const c = byId(folderMap[seg]); if (c) return { client: c, how: 'mapped folder' } }
   }
   for (const seg of segments) {
@@ -151,9 +185,13 @@ export function resolveClient(
     if (c) return { client: c, how: 'folder name' }
   }
 
-  const stem = file.name.replace(/\.md$/i, '')
   const c = bySlug(stem)
   if (c) return { client: c, how: 'file name' }
+
+  // Last, what the plugin matched on its own earlier: exact names and a person's mapping beat it.
+  for (const seg of [...segments, stem]) {
+    if (autoMap[seg]) { const a = byId(autoMap[seg]); if (a) return { client: a, how: 'matched automatically' } }
+  }
 
   return { client: null, how: 'unresolved' }
 }
@@ -167,7 +205,7 @@ export async function runSync(
   /** Walk everything and report, writing nothing and sending nothing. */
   dryRun = false,
 ): Promise<RunResult> {
-  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], unresolved: [], matched: [], wouldSend: [] }
+  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], unresolved: [], matched: [], wouldSend: [], autoMatched: [] }
 
   onProgress?.('Checking what this workspace allows…')
   const config: Config = await api.config()
@@ -177,21 +215,37 @@ export async function runSync(
   }
 
   const clients = await api.clients()
-  const root = app.vault.getAbstractFileByPath(normalizePath(settings.clientRoot))
-  if (!(root instanceof TFolder)) {
-    throw new Error(`No folder at "${settings.clientRoot}". Set the client folder in the plugin settings.`)
+  // The folder a person set, if it is there. Otherwise found: the folder where most entries are
+  // named after this agency's clients. A preview finds it too but saves nothing.
+  let clientRoot = settings.clientRoot
+  let root = folderAt(app, clientRoot)
+  if (!root) {
+    const found = findClientRoot(app, clients, config.write_into)
+    if (!found) {
+      throw new Error(clientRoot
+        ? `No folder at "${clientRoot}", and no folder in this vault is named after an Agency OS client. Set the client folder in the plugin settings.`
+        : 'No folder in this vault is named after an Agency OS client. Set the client folder in the plugin settings, or add an aos_client property to a note.')
+    }
+    clientRoot = found.path
+    root = folderAt(app, clientRoot)!
+    result.foundRoot = { path: clientRoot, clients: found.hits }
+    if (!dryRun) settings.clientRoot = clientRoot
   }
 
   // Resolve every note independently, so the vault's shape never decides whether it syncs.
   const files = allMarkdown(root, config.write_into)
-  const rootPath = normalizePath(settings.clientRoot)
+  // '/' (the top of the vault) stays '/': no note path starts with it, so every path is taken
+  // whole, which is right when the client folders sit at the top.
+  const rootPath = clientRoot === '/' ? '/' : normalizePath(clientRoot)
+  const autoMap = { ...(settings.autoMap || {}) }
   const byClient = new Map<string, { client: Client; files: TFile[]; hows: string[] }>()
   const unresolved = new Map<string, string[]>()
 
   for (const file of files) {
     const content = await app.vault.cachedRead(file)
-    const { client, how } = resolveClient(file, content, rootPath, clients, settings.folderMap)
+    const { client, how } = resolveClient(file, content, rootPath, clients, settings.folderMap, autoMap)
     if (!client) {
+      if (how === 'excluded') continue
       if (how === 'frontmatter-unknown') {
         result.skipped.push(`${file.path}: its aos_client line names a client that is not in Agency OS`)
       } else {
@@ -211,6 +265,23 @@ export async function runSync(
     byClient.get(client.id)!.files.push(file)
     byClient.get(client.id)!.hows.push(how)
   }
+  // What is left over: matched on its own only when exactly one client clearly fits the name,
+  // then listed in the settings where it can be changed. Everything else waits for a person.
+  for (const [label, paths] of [...unresolved.entries()]) {
+    const pick = autoPick(label, clients)
+    if (!pick) continue
+    autoMap[label] = pick.client.id
+    result.autoMatched.push({ label, client: pick.client.name, why: pick.why })
+    if (!byClient.has(pick.client.id)) byClient.set(pick.client.id, { client: pick.client, files: [], hows: [] })
+    const entry = byClient.get(pick.client.id)!
+    for (const path of paths) {
+      const f = app.vault.getAbstractFileByPath(path)
+      if (f instanceof TFile) { entry.files.push(f); entry.hows.push('matched automatically') }
+    }
+    unresolved.delete(label)
+  }
+  if (!dryRun) settings.autoMap = autoMap
+
   result.unmatched = [...unresolved.keys()]
   result.unresolved = [...unresolved.entries()].map(([label, paths]) => ({ label, paths }))
   result.matched = [...byClient.values()].map(v => ({
@@ -256,6 +327,7 @@ export async function runSync(
 
   // ---- pull --------------------------------------------------------------------------------
   if (config.may_pull && settings.pull && !dryRun) {
+    const base = clientRoot === '/' ? '' : clientRoot
     for (const { client, files: mine } of byClient.values()) {
       onProgress?.(`Fetching ${client.name}…`)
       const data = await api.pull(client.id, settings.pullSince || undefined)
@@ -267,8 +339,8 @@ export async function runSync(
       const rel = first.path.startsWith(rootPath) ? first.path.slice(rootPath.length + 1) : first.path
       const ownFolder = rel.includes('/') ? rel.split('/')[0] : null
       const dir = normalizePath(ownFolder
-        ? `${settings.clientRoot}/${ownFolder}/${config.write_into}`
-        : `${settings.clientRoot}/${config.write_into}/${client.name}`)
+        ? [base, ownFolder, config.write_into].filter(Boolean).join('/')
+        : [base, config.write_into, client.name].filter(Boolean).join('/'))
 
       const notes: Array<{ name: string; body: string }> = []
       if (data.summary) {
