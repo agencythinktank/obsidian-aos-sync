@@ -38,6 +38,8 @@ export interface PullResult {
   summary: { body: string; provenance: string | null; updated: string } | null
   arc: Array<{ date: string; title: string; body: string }>
   updates_sent: Array<{ period: { start: string; end: string }; sent_at: string; body: string }>
+  // The client profile's team sections (aOS 10-29); older servers leave it out.
+  profile?: Array<{ key: string; label: string; body: string; from_vault: boolean; updated: string }>
   write_into: string
 }
 

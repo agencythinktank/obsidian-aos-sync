@@ -354,6 +354,14 @@ export async function runSync(
           body: `${data.summary.body}\n\n---\n*${data.summary.provenance || `Updated ${data.summary.updated}`}*\n`,
         })
       }
+      // The client profile as it stands in aOS (0.4.0): what the team wrote there, and the sections
+      // filled from this vault's own notes, so the vault shows what aOS will use.
+      if (data.profile?.length) {
+        notes.push({
+          name: 'Client profile',
+          body: data.profile.map(p => `## ${p.label}\n\n${p.body}\n\n*${p.from_vault ? 'From your vault notes' : 'Written in Agency OS'}${p.updated ? `, ${p.updated}` : ''}*\n`).join('\n'),
+        })
+      }
       if (data.arc.length) {
         notes.push({
           name: 'The arc',
