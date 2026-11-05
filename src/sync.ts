@@ -1,0 +1,442 @@
+import { App, TFile, TFolder, normalizePath } from 'obsidian'
+import { AosApi, Client, Config, PushDoc } from './api'
+import { AosSettings, SyncState } from './settings'
+import { autoPick, pickRoot, FolderListing } from './match'
+
+// The two directions.
+//
+// THE RULE BOTH OF THEM KEEP: neither side overwrites the other's work.
+//
+//   Pushing sends a copy. aOS files it as history and cannot touch anything a person typed there.
+//   Pulling writes ONLY inside the folder aOS owns, and even there it re-hashes the file first —
+//   if you have edited what aOS wrote, it leaves your version alone and says so rather than
+//   quietly replacing it. That is the same protection Readwise's plugin uses, and it is the whole
+//   reason this is safe to run on a schedule.
+
+/** Cheap, stable, and enough to answer "has this changed since I last saw it". */
+export function hash(text: string): string {
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)
+}
+
+const slugOf = (x: string) => x.toLowerCase().replace(/[^a-z0-9]+/g, '')
+
+/**
+ * The line that divides a file in two.
+ *
+ * Above it is aOS's, regenerated every sync. Below it is yours, and aOS never reads, moves or
+ * rewrites it. This is the same answer the rest of the product gives — ONE OWNER PER SECTION,
+ * not per document — rather than a merge that has to guess which words somebody added.
+ */
+// Matched to what the Client Vault already does, rather than invented (09-24: this is how
+// it was solved in Obsidian so people could keep their own notes). Two conventions are live in real
+// client files and BOTH are honoured, so a vault already using either is protected the first time
+// this plugin runs, without anybody editing anything to make it so:
+//
+//   `## Notes`            - the heading in nine live client wiki files
+//   `<!-- PROTECTED ...`  - the explicit marker on Two Minute Reports' profile
+//
+// New files use `## Notes` with the marker above it, so the two converge rather than a third
+// convention being added to a vault that already has enough.
+export const YOURS = '## Notes'
+const PROTECTED_MARK = '<!-- PROTECTED'
+// In the real files the heading sits ABOVE the marker, so honouring only the marker would leave
+// the heading on aOS's side of the line and rewrite it away.
+const PROTECTED_HEADING = '## Protected Notes'
+const YOURS_HINT = PROTECTED_MARK + ' - Agency OS never writes below this line. Human only. -->\n' + YOURS + '\n\n'
+
+/**
+ * Split a file into what aOS wrote and what a person owns underneath.
+ *
+ * Whichever boundary appears FIRST wins, so a file carrying both markers never leaves an earlier
+ * human section stranded on aOS's side of the line.
+ */
+export function splitOwnership(content: string): { aos: string; yours: string } {
+  const found = [content.indexOf(PROTECTED_MARK), content.indexOf(PROTECTED_HEADING), content.indexOf(YOURS)]
+    .filter(i => i !== -1)
+  if (!found.length) return { aos: content, yours: '' }
+  const at = Math.min.apply(null, found)
+  return { aos: content.slice(0, at).trimEnd(), yours: content.slice(at).trimEnd() }
+}
+
+export interface RunResult {
+  pushed: number
+  pulled: number
+  skipped: string[]
+  conflicts: string[]
+  unmatched: string[]
+  /** The same, with the notes behind each one, so a picker can record an answer. */
+  unresolved: Array<{ label: string; paths: string[] }>
+  /** Which clients were found, how each was worked out, and which notes belong to them. */
+  matched: Array<{ client: string; clientId: string; files: number; how: string; paths: string[] }>
+  /** Set on a preview: what WOULD be sent, listed rather than counted. */
+  wouldSend?: string[]
+  /** Set when the plugin had to find the client folder itself this run. */
+  foundRoot?: { path: string; clients: number }
+  /** Names this run matched to a client because exactly one client fits. */
+  autoMatched: Array<{ label: string; client: string; why: string }>
+}
+
+/** Every markdown file under a root, excluding the folder aOS writes into. */
+function allMarkdown(folder: TFolder, exclude: string): TFile[] {
+  const out: TFile[] = []
+  const walk = (f: TFolder) => {
+    for (const child of f.children) {
+      if (child instanceof TFolder) {
+        // Never send aOS its own output back to it — that is how a sync loop starts.
+        if (child.name === exclude) continue
+        walk(child)
+      } else if (child instanceof TFile && child.extension === 'md') {
+        out.push(child)
+      }
+    }
+  }
+  walk(folder)
+  return out
+}
+
+/** The folder at a path, '/' being the top of the vault. Empty means not set. */
+export function folderAt(app: App, path: string): TFolder | null {
+  if (!path) return null
+  if (path === '/') return app.vault.getRoot()
+  const f = app.vault.getAbstractFileByPath(normalizePath(path))
+  return f instanceof TFolder ? f : null
+}
+
+/** Every folder in the vault with the names directly inside it, for pickRoot. */
+export function findClientRoot(app: App, clients: Client[], exclude: string): { path: string; hits: number } | null {
+  const listings: FolderListing[] = []
+  const walk = (f: TFolder) => {
+    const names: string[] = []
+    for (const child of f.children) {
+      // Obsidian's own folders and aOS's output are never where client notes live.
+      if (child.name.startsWith('.') || child.name === exclude) continue
+      if (child instanceof TFolder) { names.push(child.name); walk(child) }
+      else if (child instanceof TFile && child.extension === 'md') names.push(child.basename)
+    }
+    listings.push({ path: f.isRoot() ? '/' : f.path, names })
+  }
+  walk(app.vault.getRoot())
+  return pickRoot(listings, clients)
+}
+
+/** The `aos_client:` line from a note's frontmatter, if it has one. */
+export function frontmatterClient(content: string): string | null {
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  if (!fm) return null
+  const line = fm[1].split(/\r?\n/).find(l => /^aos[_-]client\s*:/i.test(l))
+  if (!line) return null
+  return line.split(':').slice(1).join(':').trim().replace(/^["']|["']$/g, '') || null
+}
+
+/**
+ * Which client a note belongs to, without caring where it lives.
+ *
+ * Every vault is arranged differently — one folder per client, one FILE per client, a raw/wiki/
+ * output split, nested by year, or none of the above (09-25). Insisting on a shape means
+ * working for one agency and silently doing nothing for the next, so the shape is only ever a
+ * hint. Four signals, most explicit first:
+ *
+ *   1. `aos_client:` in the note's frontmatter — says so outright, and survives any reorganisation
+ *   2. a folder on its path the person mapped by hand
+ *   3. a folder on its path whose name matches a client
+ *   4. the note's own filename matching a client
+ *
+ * Anything still unresolved is REPORTED, never guessed. A note filed against the wrong client is
+ * worse than one that did not sync.
+ */
+export function resolveClient(
+  file: TFile,
+  content: string,
+  rootPath: string,
+  clients: Client[],
+  folderMap: Record<string, string>,
+  autoMap: Record<string, string> = {},
+): { client: Client | null; how: string } {
+  const byId = (v: string) => clients.find(c => c.id === v)
+  const bySlug = (v: string) => clients.find(c => c.slugs.includes(slugOf(v)))
+
+  const declared = frontmatterClient(content)
+  if (declared) {
+    const hit = byId(declared) || bySlug(declared)
+    // A declaration that names nobody is an error worth surfacing, not a reason to fall through
+    // to guessing — somebody wrote that line on purpose.
+    return { client: hit || null, how: hit ? 'frontmatter' : 'frontmatter-unknown' }
+  }
+
+  const rel = file.path.startsWith(rootPath) ? file.path.slice(rootPath.length + 1) : file.path
+  const segments = rel.split('/').slice(0, -1)
+  const stem = file.name.replace(/\.md$/i, '')
+  // A person's answer first, including "do not sync these".
+  for (const seg of [...segments, stem]) {
+    if (folderMap[seg] === 'none') return { client: null, how: 'excluded' }
+    if (folderMap[seg]) { const c = byId(folderMap[seg]); if (c) return { client: c, how: 'mapped folder' } }
+  }
+  for (const seg of segments) {
+    const c = bySlug(seg)
+    if (c) return { client: c, how: 'folder name' }
+  }
+
+  const c = bySlug(stem)
+  if (c) return { client: c, how: 'file name' }
+
+  // Last, what the plugin matched on its own earlier: exact names and a person's mapping beat it.
+  for (const seg of [...segments, stem]) {
+    if (autoMap[seg]) { const a = byId(autoMap[seg]); if (a) return { client: a, how: 'matched automatically' } }
+  }
+
+  return { client: null, how: 'unresolved' }
+}
+
+export async function runSync(
+  app: App,
+  api: AosApi,
+  settings: AosSettings,
+  state: SyncState,
+  onProgress?: (msg: string) => void,
+  /** Walk everything and report, writing nothing and sending nothing. */
+  dryRun = false,
+): Promise<RunResult> {
+  const result: RunResult = { pushed: 0, pulled: 0, skipped: [], conflicts: [], unmatched: [], unresolved: [], matched: [], wouldSend: [], autoMatched: [] }
+
+  onProgress?.('Checking what this workspace allows…')
+  const config: Config = await api.config()
+  if (config.direction === 'off') {
+    result.skipped.push('Vault sync is paused for this workspace.')
+    return result
+  }
+
+  const clients = await api.clients()
+  // The folder a person set, if it is there. Otherwise found: the folder where most entries are
+  // named after this agency's clients. A preview finds it too but saves nothing.
+  let clientRoot = settings.clientRoot
+  let root = folderAt(app, clientRoot)
+  if (!root) {
+    const found = findClientRoot(app, clients, config.write_into)
+    if (!found) {
+      throw new Error(clientRoot
+        ? `No folder at "${clientRoot}", and no folder in this vault is named after an Agency OS client. Set the client folder in the plugin settings.`
+        : 'No folder in this vault is named after an Agency OS client. Set the client folder in the plugin settings, or add an aos_client property to a note.')
+    }
+    clientRoot = found.path
+    root = folderAt(app, clientRoot)!
+    result.foundRoot = { path: clientRoot, clients: found.hits }
+    if (!dryRun) settings.clientRoot = clientRoot
+  }
+
+  // Resolve every note independently, so the vault's shape never decides whether it syncs.
+  const files = allMarkdown(root, config.write_into)
+  // '/' (the top of the vault) stays '/': no note path starts with it, so every path is taken
+  // whole, which is right when the client folders sit at the top.
+  const rootPath = clientRoot === '/' ? '/' : normalizePath(clientRoot)
+  // Answers given in aOS come first: they are the agency's, and they are how a folder gets fixed
+  // without anybody sitting at this machine.
+  const serverMap = config.folder_map || {}
+  const folderMap = { ...settings.folderMap, ...serverMap }
+  const autoMap = { ...(settings.autoMap || {}) }
+  for (const label of Object.keys(serverMap)) delete autoMap[label]
+  const byClient = new Map<string, { client: Client; files: TFile[]; hows: string[] }>()
+  const unresolved = new Map<string, string[]>()
+
+  for (const file of files) {
+    const content = await app.vault.cachedRead(file)
+    const { client, how } = resolveClient(file, content, rootPath, clients, folderMap, autoMap)
+    if (!client) {
+      if (how === 'excluded') continue
+      if (how === 'frontmatter-unknown') {
+        result.skipped.push(`${file.path}: its aos_client line names a client that is not in Agency OS`)
+      } else {
+        // Reported by the folder it sits in, or by itself if it sits loose — that is the unit a
+        // person can actually act on.
+        const rel = file.path.startsWith(rootPath) ? file.path.slice(rootPath.length + 1) : file.path
+        const seg = rel.split('/')
+        // Grouped by the folder it sits in, or by itself when it sits loose — the unit somebody
+        // can actually answer for.
+        const label = seg.length > 1 ? seg[0] : file.name.replace(/\.md$/i, '')
+        if (!unresolved.has(label)) unresolved.set(label, [])
+        unresolved.get(label)!.push(file.path)
+      }
+      continue
+    }
+    if (!byClient.has(client.id)) byClient.set(client.id, { client, files: [], hows: [] })
+    byClient.get(client.id)!.files.push(file)
+    byClient.get(client.id)!.hows.push(how)
+  }
+  // What is left over: matched on its own only when exactly one client clearly fits the name,
+  // then listed in the settings where it can be changed. Everything else waits for a person.
+  for (const [label, paths] of [...unresolved.entries()]) {
+    const pick = autoPick(label, clients)
+    if (!pick) continue
+    autoMap[label] = pick.client.id
+    result.autoMatched.push({ label, client: pick.client.name, why: pick.why })
+    if (!byClient.has(pick.client.id)) byClient.set(pick.client.id, { client: pick.client, files: [], hows: [] })
+    const entry = byClient.get(pick.client.id)!
+    for (const path of paths) {
+      const f = app.vault.getAbstractFileByPath(path)
+      if (f instanceof TFile) { entry.files.push(f); entry.hows.push('matched automatically') }
+    }
+    unresolved.delete(label)
+  }
+  if (!dryRun) settings.autoMap = autoMap
+
+  result.unmatched = [...unresolved.keys()]
+  result.unresolved = [...unresolved.entries()].map(([label, paths]) => ({ label, paths }))
+  result.matched = [...byClient.values()].map(v => ({
+    client: v.client.name, clientId: v.client.id, files: v.files.length,
+    how: [...new Set(v.hows)].join(', '), paths: v.files.map(f => f.path),
+  }))
+
+  // ---- push --------------------------------------------------------------------------------
+  if (config.may_push && settings.push) {
+    const docs: PushDoc[] = []
+    for (const { client, files: mine } of byClient.values()) {
+      for (const file of mine) {
+        const body = await app.vault.cachedRead(file)
+        const h = hash(body)
+        // Unchanged files cost nothing. Without this, every run re-sends the whole vault.
+        if (state.pushed[file.path] === h) continue
+        docs.push({
+          client_id: client.id,
+          path: file.path,
+          body,
+          occurred_at: new Date(file.stat.mtime).toISOString().slice(0, 10),
+        })
+      }
+    }
+
+    if (dryRun) {
+      result.wouldSend = docs.map(d => d.path)
+      result.pushed = docs.length
+    }
+    for (let i = 0; dryRun ? false : i < docs.length; i += 50) {
+      const batch = docs.slice(i, i + 50)
+      onProgress?.(`Sending ${i + 1}–${i + batch.length} of ${docs.length}…`)
+      const res = await api.push(batch)
+      result.skipped.push(...res.skipped)
+      const refused = new Set(res.skipped.map(s => String(s).split(':')[0]))
+      for (const d of batch) {
+        if (refused.has(d.path)) continue
+        state.pushed[d.path] = hash(d.body)
+        result.pushed += 1
+      }
+    }
+  }
+
+  // ---- pull --------------------------------------------------------------------------------
+  if (config.may_pull && settings.pull && !dryRun) {
+    const base = clientRoot === '/' ? '' : clientRoot
+    for (const { client, files: mine } of byClient.values()) {
+      onProgress?.(`Fetching ${client.name}…`)
+      const data = await api.pull(client.id, settings.pullSince || undefined)
+      // Where aOS writes depends on how this client's notes are arranged. If they live in a
+      // folder of their own, aOS's folder goes inside it, where somebody would look. If they are
+      // loose files, there is no such folder — so aOS makes one per client under its own, rather
+      // than scattering notes beside somebody else's.
+      const first = mine[0]
+      const rel = first.path.startsWith(rootPath) ? first.path.slice(rootPath.length + 1) : first.path
+      const ownFolder = rel.includes('/') ? rel.split('/')[0] : null
+      const dir = normalizePath(ownFolder
+        ? [base, ownFolder, config.write_into].filter(Boolean).join('/')
+        : [base, config.write_into, client.name].filter(Boolean).join('/'))
+
+      const notes: Array<{ name: string; body: string }> = []
+      if (data.summary) {
+        notes.push({
+          name: 'Where they are now',
+          body: `${data.summary.body}\n\n---\n*${data.summary.provenance || `Updated ${data.summary.updated}`}*\n`,
+        })
+      }
+      // The client profile as it stands in aOS (0.4.0): what the team wrote there, and the sections
+      // filled from this vault's own notes, so the vault shows what aOS will use.
+      if (data.profile?.length) {
+        notes.push({
+          name: 'Client profile',
+          body: data.profile.map(p => `## ${p.label}\n\n${p.body}\n\n*${p.from_vault ? 'From your vault notes' : 'Written in Agency OS'}${p.updated ? `, ${p.updated}` : ''}*\n`).join('\n'),
+        })
+      }
+      if (data.arc.length) {
+        notes.push({
+          name: 'The arc',
+          body: data.arc.map(a => `## ${a.date} — ${a.title}\n\n${a.body}\n`).join('\n'),
+        })
+      }
+      if (data.updates_sent.length) {
+        notes.push({
+          name: 'Updates sent',
+          body: data.updates_sent.map(u => `## Sent ${u.sent_at}\n*Covering ${u.period.start} to ${u.period.end}*\n\n${u.body}\n`).join('\n---\n\n'),
+        })
+      }
+      if (!notes.length) continue
+
+      if (!(app.vault.getAbstractFileByPath(dir) instanceof TFolder)) {
+        await app.vault.createFolder(dir).catch(() => {})
+      }
+
+      for (const note of notes) {
+        const path = normalizePath(`${dir}/${note.name}.md`)
+        const header = '> [!info] Written by Agency OS\n'
+          + '> This part is rewritten each sync. Add your own notes under "Notes" at the bottom\n'
+          + '> and they are kept — aOS never touches anything below that line.\n\n'
+        const content = header + note.body
+        const existing = app.vault.getAbstractFileByPath(path)
+
+        if (existing instanceof TFile) {
+          const current = await app.vault.read(existing)
+          // If the file no longer matches what aOS last wrote, a person has edited it. Their
+          // version stands.
+          //
+          // But standing back forever and saying so once in a toast is its own failure: aOS keeps
+          // producing new summaries, this copy stays frozen at the moment it was edited, and
+          // months later somebody is reading something stale that looks current (09-24).
+          //
+          // So the newer version is written ALONGSIDE, in its own file. Nothing of theirs is
+          // touched, nothing from aOS is lost, and the difference is visible in the folder rather
+          // than only in a notice that has scrolled away.
+          const split = splitOwnership(current)
+          // Only aOS's half decides whether somebody has been editing ITS work. A person writing
+          // under the line is the supported case, not a conflict — that is the entire point of
+          // having a line.
+          if (state.pulled[path] && hash(split.aos) !== state.pulled[path]) {
+            result.conflicts.push(path)
+            const asidePath = normalizePath(`${dir}/${note.name} (newer from aOS).md`)
+            const aside = `> [!warning] You edited "${note.name}", so aOS stopped replacing it\n`
+              + `> This is what aOS has now, kept separate so neither version is lost. Merge what you want\n`
+              + `> into your own file, then use "Let aOS manage this again" in the plugin settings.\n\n`
+              + note.body
+            const existingAside = app.vault.getAbstractFileByPath(asidePath)
+            if (existingAside instanceof TFile) {
+              if (hash(await app.vault.read(existingAside)) !== hash(aside)) await app.vault.modify(existingAside, aside)
+            } else {
+              await app.vault.create(asidePath, aside)
+            }
+            // Remembered so the settings page can list it long after the notice has gone.
+            state.conflicts = state.conflicts || {}
+            state.conflicts[path] = { since: state.conflicts[path]?.since || new Date().toISOString(), aside: asidePath }
+            continue
+          }
+          // Back in step: if it was in conflict and now matches again, stop reporting it.
+          if (state.conflicts?.[path]) delete state.conflicts[path]
+          // Their section is carried across verbatim onto the newly written aOS half.
+          const merged = split.yours ? `${content.trimEnd()}\n\n${split.yours}\n` : content
+          if (hash(current) === hash(merged)) continue
+          await app.vault.modify(existing, merged)
+        } else {
+          await app.vault.create(path, content + `\n${YOURS_HINT}`)
+        }
+        // Hash only what aOS owns, so tomorrow's note under the line is not read as tampering.
+        state.pulled[path] = hash(content.trimEnd())
+        result.pulled += 1
+      }
+    }
+  }
+
+  return result
+}
