@@ -79,7 +79,7 @@ export function suggest(name: string, clients: Client[], limit = 3): Array<{ cli
 
   const scored: Array<{ client: Client; score: number; why: string }> = []
   for (const c of clients) {
-    const names = [c.name, ...(c.slugs || [])].filter(Boolean) as string[]
+    const names = [c.name, ...(c.slugs || [])].filter((n): n is string => Boolean(n))
     let best = 0
     let why = ''
     for (const raw of names) {

@@ -27,7 +27,7 @@ export default class AosSyncPlugin extends Plugin {
 
     // registerInterval so it is cleaned up on unload rather than left running.
     if (this.settings.interval > 0) {
-      this.registerInterval(window.setInterval(() => this.sync(false), this.settings.interval * 60_000))
+      this.registerInterval(window.setInterval(() => { void this.sync(false) }, this.settings.interval * 60_000))
     }
     // Checked once on load, so a revoked connection is visible before anyone tries to use it.
     if (this.settings.apiKey) this.app.workspace.onLayoutReady(() => this.checkConnection())
@@ -457,7 +457,7 @@ class AosSettingTab extends PluginSettingTab {
 
   /** What happened last time, in words, wherever the status bar is or is not. */
   private lastRunLine(): string {
-    const { lastRun, lastError, pushed, pulled } = this.plugin.state as any
+    const { lastRun, lastError, pushed, pulled } = this.plugin.state
     if (!lastRun) return 'Never synced.'
     const when = new Date(lastRun)
     const mins = Math.round((Date.now() - when.getTime()) / 60000)
@@ -559,8 +559,8 @@ class AosSettingTab extends PluginSettingTab {
     const tick = async () => {
       if (Date.now() > until) { new Notice('That connection request expired. Try again.'); return }
       let res
-      try { res = await pollAuth(base, start.code) } catch { window.setTimeout(tick, 3000); return }
-      if (res.status === 'pending') { window.setTimeout(tick, 2000); return }
+      try { res = await pollAuth(base, start.code) } catch { window.setTimeout(() => { void tick() }, 3000); return }
+      if (res.status === 'pending') { window.setTimeout(() => { void tick() }, 2000); return }
       if (res.status === 'approved' && res.key) {
         this.plugin.settings.apiKey = res.key
         this.plugin.settings.orgName = res.org?.name || null
@@ -571,6 +571,6 @@ class AosSettingTab extends PluginSettingTab {
       }
       new Notice(res.status === 'denied' ? 'That request was refused in Agency OS.' : 'That request expired.')
     }
-    window.setTimeout(tick, 2500)
+    window.setTimeout(() => { void tick() }, 2500)
   }
 }

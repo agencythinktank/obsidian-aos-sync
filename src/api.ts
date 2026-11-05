@@ -49,6 +49,12 @@ export class AuthError extends Error {
   constructor(message: string) { super(message); this.name = 'AuthError' }
 }
 
+/** aOS's error sentence from a JSON body, or the fallback when there is none. */
+function errorOf(res: RequestUrlResponse, fallback: string): string {
+  const body = res.json as { error?: unknown } | null | undefined
+  return typeof body?.error === 'string' ? body.error : fallback
+}
+
 export class AosApi {
   constructor(private baseUrl: string, private key: string) {}
 
@@ -72,30 +78,31 @@ export class AosApi {
     // A 401 means the key itself is no longer good — revoked in aOS, or the workspace is gone.
     // Distinguished from any other failure because it is the one the user must act on, and the
     // one that otherwise hides: a plugin holding a dead key looks connected forever.
-    if (res.status === 401) throw new AuthError(res.json?.error || 'This connection is no longer valid')
-    if (res.status !== 200) throw new Error(res.json?.error || `aOS returned ${res.status}`)
+    if (res.status === 401) throw new AuthError(errorOf(res, 'This connection is no longer valid'))
+    if (res.status !== 200) throw new Error(errorOf(res, `aOS returned ${res.status}`))
     return res.json as Config
   }
 
   async clients(): Promise<Client[]> {
     const res = await this.call('GET', '/api/plugin/clients')
-    if (res.status !== 200) throw new Error(res.json?.error || `aOS returned ${res.status}`)
-    return (res.json?.clients || []) as Client[]
+    if (res.status !== 200) throw new Error(errorOf(res, `aOS returned ${res.status}`))
+    return (res.json as { clients?: Client[] } | null)?.clients || []
   }
 
   /** Returns what was filed, and what aOS refused with its reason. */
   async push(documents: PushDoc[]): Promise<{ saved: unknown[]; skipped: string[] }> {
     const res = await this.call('POST', '/api/client-context/sync', { documents })
-    if (res.status === 403) throw new Error(res.json?.error || 'Pushing is switched off for this workspace')
-    if (res.status !== 200) throw new Error(res.json?.error || `aOS returned ${res.status}`)
-    return { saved: res.json?.saved || [], skipped: res.json?.skipped || [] }
+    if (res.status === 403) throw new Error(errorOf(res, 'Pushing is switched off for this workspace'))
+    if (res.status !== 200) throw new Error(errorOf(res, `aOS returned ${res.status}`))
+    const body = res.json as { saved?: unknown[]; skipped?: string[] } | null
+    return { saved: body?.saved || [], skipped: body?.skipped || [] }
   }
 
   async pull(clientId: string, since?: string): Promise<PullResult> {
     const q = since ? `&since=${encodeURIComponent(since)}` : ''
     const res = await this.call('GET', `/api/client-context/sync?client_id=${encodeURIComponent(clientId)}${q}`)
-    if (res.status === 403) throw new Error(res.json?.error || 'Pulling is switched off for this workspace')
-    if (res.status !== 200) throw new Error(res.json?.error || `aOS returned ${res.status}`)
+    if (res.status === 403) throw new Error(errorOf(res, 'Pulling is switched off for this workspace'))
+    if (res.status !== 200) throw new Error(errorOf(res, `aOS returned ${res.status}`))
     return res.json as PullResult
   }
 
@@ -125,7 +132,7 @@ export async function startAuth(baseUrl: string, clientName: string): Promise<Au
     body: JSON.stringify({ client_name: clientName }),
     throw: false,
   })
-  if (res.status !== 200) throw new Error(res.json?.error || `aOS returned ${res.status}`)
+  if (res.status !== 200) throw new Error(errorOf(res, `aOS returned ${res.status}`))
   return res.json as AuthStart
 }
 
@@ -136,5 +143,5 @@ export async function pollAuth(baseUrl: string, code: string): Promise<{ status:
     throw: false,
   })
   if (res.status !== 200) throw new Error(`aOS returned ${res.status}`)
-  return res.json
+  return res.json as { status: string; key?: string; org?: { name: string | null } }
 }

@@ -63,7 +63,7 @@ export function splitOwnership(content: string): { aos: string; yours: string } 
   const found = [content.indexOf(PROTECTED_MARK), content.indexOf(PROTECTED_HEADING), content.indexOf(YOURS)]
     .filter(i => i !== -1)
   if (!found.length) return { aos: content, yours: '' }
-  const at = Math.min.apply(null, found)
+  const at = Math.min(...found)
   return { aos: content.slice(0, at).trimEnd(), yours: content.slice(at).trimEnd() }
 }
 
