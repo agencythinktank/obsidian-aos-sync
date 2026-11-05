@@ -32,6 +32,8 @@ export interface AosSettings {
    * (autoPick in match.ts). Listed in the settings with a way to change each one.
    */
   autoMap: Record<string, string>
+  /** The one-time "press Connect" notice after installing has been shown. */
+  welcomed: boolean
 }
 
 export const DEFAULT_SETTINGS: AosSettings = {
@@ -49,6 +51,7 @@ export const DEFAULT_SETTINGS: AosSettings = {
   pullSince: '',
   folderMap: {},
   autoMap: {},
+  welcomed: false,
 }
 
 /**

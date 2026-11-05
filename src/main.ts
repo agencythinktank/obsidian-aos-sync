@@ -31,6 +31,14 @@ export default class AosSyncPlugin extends Plugin {
     }
     // Checked once on load, so a revoked connection is visible before anyone tries to use it.
     if (this.settings.apiKey) this.app.workspace.onLayoutReady(() => this.checkConnection())
+    // Installed but not connected: say once where Connect is, since nothing can sync until then.
+    if (!this.settings.apiKey && !this.settings.welcomed) {
+      this.app.workspace.onLayoutReady(() => {
+        new Notice('Agency OS Sync is installed. To start syncing, open Settings → Agency OS Sync and press Connect.', 15000)
+        this.settings.welcomed = true
+        void this.save()
+      })
+    }
     if (this.settings.syncOnStartup && this.settings.apiKey) {
       // After layout so a sync never competes with the vault finishing its own load.
       this.app.workspace.onLayoutReady(() => this.sync(false))
@@ -565,7 +573,11 @@ class AosSettingTab extends PluginSettingTab {
         this.plugin.settings.apiKey = res.key
         this.plugin.settings.orgName = res.org?.name || null
         await this.plugin.save()
-        new Notice('Connected to Agency OS.')
+        new Notice('Connected to Agency OS. Syncing now…')
+        this.display()
+        // The first sync runs straight away rather than at the next hourly tick, so the client
+        // folders show up in Agency OS (and its summaries here) while the person is still looking.
+        await this.plugin.sync(true)
         this.display()
         return
       }
